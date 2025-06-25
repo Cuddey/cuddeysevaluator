@@ -15,7 +15,7 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
 
 app = Flask(__name__)
 
-# CAD scrapers
+# 1) CAD Scrapers for Texas appraisal districts
 def tarrant_cad(address):
     url = f"https://www.tad.org/property-search-results/?searchtext={quote_plus(address)}"
     html = requests.get(url, timeout=10).text
@@ -71,7 +71,7 @@ def get_cad_details(county, state, address):
     return {'link': f"https://www.google.com/search?q={query}"}
 
 
-# LLC tracing
+# 2) LLC Tracing via OpenCorporates
 def get_llc_info(owner_name):
     if not owner_name:
         return {}
@@ -95,7 +95,7 @@ def get_llc_info(owner_name):
         return {}
 
 
-# Owner profile and web search
+# 3) Owner Profile stub and online search
 def get_owner_profile(llc_name):
     return {
         'linkedIn': 'N/A',
@@ -129,7 +129,7 @@ def search_owner_online(owner_name, address):
     return results
 
 
-# Market and competition
+# 4) Market and competition via Google Places
 def nearby_storage(lat, lng, radius_m):
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     params = {
@@ -180,7 +180,7 @@ def get_market_comps(lat, lng):
     }
 
 
-# Comparables scrapers
+# 5) Comparables scrapers (Crexi and LoopNet) with timeout handling
 def scrape_crexi(lat, lng, radius_m=1):
     listings = []
     try:
@@ -239,13 +239,10 @@ def scrape_loopnet(lat, lng, radius_m=1):
     return listings
 
 def get_surrounding_listings(lat, lng):
-    out = []
-    out += scrape_crexi(lat, lng)
-    out += scrape_loopnet(lat, lng)
-    return out
+    return scrape_crexi(lat, lng) + scrape_loopnet(lat, lng)
 
 
-# Tax history stub
+# 6) Tax history stub
 def get_tax_history(address):
     return [
         {'year': 2023, 'tax': 3200},
@@ -257,36 +254,20 @@ def get_tax_history(address):
 @app.route('/', methods=['GET', 'POST'])
 def index():
     data = {
-        'address': '',
-        'lat': 0,
-        'lng': 0,
-        'county': '',
-        'state': '',
-        'place': {},
-        'cad': {},
-        'llc': {},
-        'owner': {},
-        'owner_web': [],
-        'market': {
-            'competitors_5': [], 'count_5': 0, 'density_5': 0,
-            'competitors_10': [], 'count_10': 0, 'density_10': 0
-        },
-        'cap': 0,
-        'ppsf': 0,
-        'score': '',
-        'nrsf': 0,
-        'listings': [],
-        'recommended_ppsf': 0,
-        'recommended_value': 0,
-        'tax_records': [],
-        'avg_tax': 0
+        'address': '', 'lat': 0, 'lng': 0,
+        'county': '', 'state': '',
+        'place': {}, 'cad': {}, 'llc': {}, 'owner': {}, 'owner_web': [],
+        'market': {'competitors_5': [], 'count_5': 0, 'density_5': 0,
+                   'competitors_10': [], 'count_10': 0, 'density_10': 0},
+        'cap': 0, 'ppsf': 0, 'score': '',
+        'nrsf': 0, 'listings': [], 'recommended_ppsf': 0,
+        'recommended_value': 0, 'tax_records': [], 'avg_tax': 0
     }
     error = None
 
     if request.method == 'POST':
         addr_in = request.form.get('query', '').strip()
         fac_in  = request.form.get('facility', '').strip()
-
         if not addr_in and not fac_in:
             error = "Enter address or facility name."
         else:
@@ -304,18 +285,10 @@ def index():
                 lat   = r0['geometry']['location']['lat']
                 lng   = r0['geometry']['location']['lng']
                 comps = r0['address_components']
-                county = next(
-                    (c['long_name'].replace(' County','')
-                     for c in comps
-                     if 'administrative_area_level_2' in c['types']),
-                    'Unknown'
-                )
-                state = next(
-                    (c['short_name']
-                     for c in comps
-                     if 'administrative_area_level_1' in c['types']),
-                    ''
-                )
+                county = next((c['long_name'].replace(' County','')
+                               for c in comps if 'administrative_area_level_2' in c['types']), 'Unknown')
+                state  = next((c['short_name']
+                               for c in comps if 'administrative_area_level_1' in c['types']), '')
 
                 fp = requests.get(
                     "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
@@ -339,11 +312,11 @@ def index():
                         }
                     ).json().get('result', {})
 
-                cad        = get_cad_details(county, state, addr)
-                llc        = get_llc_info(cad.get('owner_name', ''))
-                owner      = get_owner_profile(llc.get('llc_name', ''))
-                owner_web  = search_owner_online(cad.get('owner_name', '') or addr_in, addr)
-                market     = get_market_comps(lat, lng)
+                cad       = get_cad_details(county, state, addr)
+                llc       = get_llc_info(cad.get('owner_name', ''))
+                owner     = get_owner_profile(llc.get('llc_name', ''))
+                owner_web = search_owner_online(cad.get('owner_name', '') or addr_in, addr)
+                market    = get_market_comps(lat, lng)
 
                 ask, inc, exp, nrsf = 1_200_000, 15_000, 5_000, 20_000
                 noi  = (inc - exp) * 12
@@ -352,11 +325,11 @@ def index():
                 sv   = (cap >= 7) + (ppsf < 75) + (ask < (noi / 0.07))
                 score = ['Pass', 'Weak', 'Explore', 'Strong'][min(3, sv)]
 
-                listings    = get_surrounding_listings(lat, lng)
-                avg_ppsf    = round(sum(l['ppsf'] for l in listings) / len(listings), 2) if listings else 0
-                rec_value   = round(avg_ppsf * nrsf, 2) if listings else 0
-                taxes       = get_tax_history(addr)
-                avg_tax     = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
+                listings  = get_surrounding_listings(lat, lng)
+                avg_ppsf  = round(sum(l['ppsf'] for l in listings) / len(listings), 2) if listings else 0
+                rec_value = round(avg_ppsf * nrsf, 2) if listings else 0
+                taxes     = get_tax_history(addr)
+                avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
                 data.update({
                     'address': addr,
