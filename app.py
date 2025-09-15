@@ -109,7 +109,7 @@ def search_owner_online(owner_name, address):
     query = owner_name or address
     results = []
     try:
-        for url in search(query, num_results=3):   # removed pause
+        for url in search(query, num_results=3):   # (fixed earlier: no pause=)
             html = requests.get(url, timeout=5).text
             soup = BeautifulSoup(html, 'html.parser')
             title = soup.title.string if soup.title else url
@@ -242,6 +242,148 @@ def get_surrounding_listings(lat, lng):
     return scrape_crexi(lat, lng) + scrape_loopnet(lat, lng)
 
 
+# === NEW: rate scraping helpers ===
+_UNIT_RE = re.compile(r'(\d{1,2})\s*[x×]\s*(\d{1,2})', re.IGNORECASE)
+_PRICE_RE = re.compile(r'\$?\s?(\d{2,4})(?:\.\d{2})?(?:\s*/\s*(?:mo|month))?', re.IGNORECASE)
+
+def _normalize_size(w, l):
+    try:
+        w = int(w); l = int(l)
+        return f"{w}x{l}"
+    except:
+        return f"{w}x{l}"
+
+def _find_rates_in_text(text):
+    """
+    Scan raw text for patterns like '5x5 ... $59', '10 x 20 - $150', etc.
+    Returns dict size -> list of prices (floats).
+    """
+    rates = {}
+    for m in _UNIT_RE.finditer(text):
+        size = _normalize_size(m.group(1), m.group(2))
+        # search near the unit size (local window)
+        start = max(m.start() - 100, 0)
+        end   = min(m.end() + 200, len(text))
+        window = text[start:end]
+        prices = _PRICE_RE.findall(window)
+        for p in prices:
+            val = float(p)
+            if 10 <= val <= 2000:  # plausible monthly rate
+                rates.setdefault(size, []).append(val)
+    return rates
+
+def scrape_rates_from_website(url):
+    """
+    Fetch a site and extract unit sizes + rates using regex.
+    Return dict size -> min advertised price (float).
+    """
+    out = {}
+    try:
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        txt = resp.text
+        # Also include visible text only to reduce noise
+        soup = BeautifulSoup(txt, 'html.parser')
+        visible = soup.get_text(separator=' ', strip=True)
+        combined = (txt[:200000] + " " + visible[:200000]).lower()  # cap to 200KB each
+        raw = _find_rates_in_text(combined)
+        for size, prices in raw.items():
+            out[size] = min(prices)  # lowest advertised
+    except Exception:
+        pass
+    return out
+
+def discover_website_for(name, vicinity, fallback_query_suffix="storage units prices"):
+    """
+    Try to discover a website via Google if Places doesn't have one.
+    """
+    query = f"{name} {vicinity} {fallback_query_suffix}"
+    try:
+        for url in search(query, num_results=3):
+            if any(t in url.lower() for t in [".com", ".net", ".org", ".storage", "units", "prices", "rates"]):
+                return url
+    except Exception:
+        pass
+    return None
+
+def get_place_website(place_id):
+    """
+    Use Places Details to get official website for a competitor place_id.
+    """
+    try:
+        res = requests.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={'place_id': place_id, 'fields': 'website', 'key': GOOGLE_API_KEY},
+            timeout=6
+        ).json()
+        return res.get('result', {}).get('website')
+    except Exception:
+        return None
+
+def build_rate_analysis(subject_place, market):
+    """
+    Scrape subject site + competitor sites (within 5mi) for unit rates.
+    Returns:
+      subject_rates: dict size -> price
+      competitors: list of {name, vicinity, website, rates{size->price}}
+      table: dict size -> {subject, competitor_avg, competitor_max, increase_pct, competitor_rates (list)}
+    """
+    # Subject website
+    subject_site = subject_place.get('website')
+    if not subject_site:
+        subj_name = subject_place.get('name', '')
+        subject_site = discover_website_for(subj_name, "")
+
+    subject_rates = scrape_rates_from_website(subject_site) if subject_site else {}
+
+    # Competitors (within 5 miles)
+    competitors_data = []
+    for comp in market.get('competitors_5', []):
+        name = comp.get('name', '')
+        vicinity = comp.get('vicinity', '')
+        website = get_place_website(comp.get('place_id')) or discover_website_for(name, vicinity)
+        rates = scrape_rates_from_website(website) if website else {}
+        competitors_data.append({
+            'name': name,
+            'vicinity': vicinity,
+            'website': website or '',
+            'rates': rates
+        })
+
+    # Build analysis table across all sizes seen anywhere
+    all_sizes = set(subject_rates.keys())
+    for c in competitors_data:
+        all_sizes.update(c['rates'].keys())
+
+    table = {}
+    for size in sorted(all_sizes, key=lambda s: (int(s.split('x')[0]) if s.split('x')[0].isdigit() else 0,
+                                                int(s.split('x')[1]) if 'x' in s and s.split('x')[1].isdigit() else 0)):
+        subj = subject_rates.get(size)
+        comp_prices = []
+        for c in competitors_data:
+            if size in c['rates']:
+                comp_prices.append(c['rates'][size])
+        if comp_prices:
+            avg_comp = round(sum(comp_prices)/len(comp_prices), 2)
+            max_comp = max(comp_prices)
+        else:
+            avg_comp = 0
+            max_comp = 0
+        if subj and max_comp:
+            inc_pct = round(((max_comp - subj) / subj) * 100, 2) if subj > 0 else 0
+        else:
+            inc_pct = 0
+        table[size] = {
+            'subject': subj if subj is not None else None,
+            'competitor_avg': avg_comp,
+            'competitor_max': max_comp,
+            'increase_pct': inc_pct,
+            'competitor_rates': comp_prices
+        }
+
+    return subject_rates, competitors_data, table
+# === END NEW ===
+
+
 # 6) Tax history stub
 def get_tax_history(address):
     return [
@@ -261,7 +403,9 @@ def index():
                    'competitors_10': [], 'count_10': 0, 'density_10': 0},
         'cap': 0, 'ppsf': 0, 'score': '',
         'nrsf': 0, 'listings': [], 'recommended_ppsf': 0,
-        'recommended_value': 0, 'tax_records': [], 'avg_tax': 0
+        'recommended_value': 0, 'tax_records': [], 'avg_tax': 0,
+        # === NEW: rate analysis containers in data ===
+        'subject_rates': {}, 'competitor_rates': [], 'rate_analysis': {}
     }
     error = None
 
@@ -331,6 +475,9 @@ def index():
                 taxes     = get_tax_history(addr)
                 avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
+                # === NEW: build rate analysis (subject + competitors) ===
+                subj_rates, comp_rates, table = build_rate_analysis(place or {}, market)
+
                 data.update({
                     'address': addr,
                     'lat': lat,
@@ -351,7 +498,11 @@ def index():
                     'recommended_ppsf': avg_ppsf,
                     'recommended_value': rec_value,
                     'tax_records': taxes,
-                    'avg_tax': avg_tax
+                    'avg_tax': avg_tax,
+                    # NEW:
+                    'subject_rates': subj_rates,
+                    'competitor_rates': comp_rates,
+                    'rate_analysis': table
                 })
 
     return render_template('index.html', data=data, error=error, google_api_key=GOOGLE_API_KEY)
