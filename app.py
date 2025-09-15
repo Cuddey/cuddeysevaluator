@@ -78,9 +78,8 @@ def get_llc_info(owner_name):
     except:
         return {}
 
-# --- 3) Human-Level Owner Lookup (stub) ---
+# --- 3) Owner Profile (stub) ---
 def get_owner_profile(llc_name):
-    # Placeholder – replace with real scrapes or API calls
     return {
         'linkedIn':     'N/A',
         'facebook':     'N/A',
@@ -89,7 +88,7 @@ def get_owner_profile(llc_name):
         'other_businesses': []
     }
 
-# --- 4) Market & Competition Module (5- and 10-mile radii, all results) ---
+# --- 4) Market & Competition (5 & 10 miles, all results) ---
 def get_market_comps(lat, lng):
     def fetch(radius_m):
         res = requests.get(
@@ -102,13 +101,12 @@ def get_market_comps(lat, lng):
             }
         ).json()
         comps = []
-        # include all results, no slicing
         for r in res.get('results', []):
             comps.append({
-                'name':    r.get('name'),
-                'rating':  r.get('rating'),
-                'reviews': r.get('user_ratings_total'),
-                'vicinity':r.get('vicinity')
+                'name':     r.get('name'),
+                'rating':   r.get('rating'),
+                'reviews':  r.get('user_ratings_total'),
+                'vicinity': r.get('vicinity')
             })
         area_sq_mi = math.pi * (radius_m / 1609.34) ** 2
         density = (len(res.get('results', [])) / area_sq_mi) if area_sq_mi else 0
@@ -123,6 +121,67 @@ def get_market_comps(lat, lng):
         'density_10':     density10
     }
 
+# --- 5) Places/Geocode helpers with bias options ---
+def geocode_address(text):
+    return requests.get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        params={'address': text, 'key': GOOGLE_API_KEY}
+    ).json()
+
+def reverse_geocode(lat, lng):
+    return requests.get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        params={'latlng': f"{lat},{lng}", 'key': GOOGLE_API_KEY}
+    ).json()
+
+def places_findplace(text, locationbias=None):
+    params = {
+        'input': text,
+        'inputtype': 'textquery',
+        'fields': 'place_id,geometry,formatted_address,name',
+        'key': GOOGLE_API_KEY
+    }
+    if locationbias:
+        params['locationbias'] = locationbias
+    return requests.get(
+        "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+        params=params
+    ).json()
+
+def places_textsearch(query, location=None, radius_m=None):
+    params = {'query': query, 'region': 'us', 'key': GOOGLE_API_KEY}
+    if location and radius_m:
+        params['location'] = f"{location[0]},{location[1]}"
+        params['radius'] = int(radius_m)
+    return requests.get(
+        "https://maps.googleapis.com/maps/api/place/textsearch/json",
+        params=params
+    ).json()
+
+def places_nearbysearch(keyword, location, radius_m, ptype=None):
+    params = {
+        'keyword': keyword,
+        'location': f"{location[0]},{location[1]}",
+        'radius': int(radius_m),
+        'key': GOOGLE_API_KEY
+    }
+    if ptype:
+        params['type'] = ptype
+    return requests.get(
+        "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+        params=params
+    ).json()
+
+def fetch_place_details(place_id):
+    return requests.get(
+        "https://maps.googleapis.com/maps/api/place/details/json",
+        params={
+            'place_id': place_id,
+            'fields': 'name,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews,photos',
+            'key': GOOGLE_API_KEY
+        }
+    ).json()
+
 @app.route('/', methods=['GET','POST'])
 def index():
     data = {}
@@ -134,80 +193,133 @@ def index():
 
         if not addr_input and not facility_input:
             error = "Please enter an address or facility name."
-        else:
-            query = facility_input or addr_input
+            return render_template('index.html', data=data, error=error, google_api_key=GOOGLE_API_KEY)
 
-            # Geocode
-            geo_res = requests.get(
-                "https://maps.googleapis.com/maps/api/geocode/json",
-                params={'address': query, 'key': GOOGLE_API_KEY}
-            ).json()
+        addr = None
+        lat = None
+        lng = None
+        place = {}
 
-            if geo_res.get('status') != 'OK':
-                error = f"Geocode failed: {geo_res.get('status')}"
+        # If we have an address string (even when searching by facility), geocode it for bias
+        bias_latlng = None
+        if addr_input:
+            g_bias = geocode_address(addr_input)
+            if g_bias.get('status') == 'OK' and g_bias.get('results'):
+                r = g_bias['results'][0]
+                bias_latlng = (r['geometry']['location']['lat'], r['geometry']['location']['lng'])
+
+        if facility_input:
+            # 1) Find Place with best available bias
+            locationbias = f"circle:50000@{bias_latlng[0]},{bias_latlng[1]}" if bias_latlng else "ipbias"
+            fp = places_findplace(facility_input, locationbias=locationbias)
+            if fp.get('candidates'):
+                c0 = fp['candidates'][0]
+                addr = c0.get('formatted_address', facility_input)
+                loc  = c0.get('geometry', {}).get('location', {})
+                lat, lng = loc.get('lat'), loc.get('lng')
+                pid = c0.get('place_id')
+                if pid:
+                    det = fetch_place_details(pid)
+                    place = det.get('result', {})
             else:
-                result = geo_res['results'][0]
-                addr  = result['formatted_address']
-                lat   = result['geometry']['location']['lat']
-                lng   = result['geometry']['location']['lng']
-                comps = result['address_components']
+                # 2) Text Search with bias if we have it
+                ts = places_textsearch(facility_input, location=bias_latlng, radius_m=50000 if bias_latlng else None)
+                if ts.get('results'):
+                    r0 = ts['results'][0]
+                    addr = r0.get('formatted_address', facility_input)
+                    loc  = r0.get('geometry', {}).get('location', {})
+                    lat, lng = loc.get('lat'), loc.get('lng')
+                    pid = r0.get('place_id')
+                    if pid:
+                        det = fetch_place_details(pid)
+                        place = det.get('result', {})
+                elif bias_latlng:
+                    # 3) Nearby Search as a last resort when we have a bias location
+                    nb = places_nearbysearch(facility_input, bias_latlng, 50000, ptype='storage')
+                    if nb.get('results'):
+                        r0 = nb['results'][0]
+                        addr = r0.get('vicinity', addr_input or facility_input)
+                        loc  = r0.get('geometry', {}).get('location', {})
+                        lat, lng = loc.get('lat'), loc.get('lng')
+                        pid = r0.get('place_id')
+                        if pid:
+                            det = fetch_place_details(pid)
+                            place = det.get('result', {})
+                    else:
+                        error = f"No facility found (FindPlace: {fp.get('status')}, TextSearch: {ts.get('status')}, Nearby: {nb.get('status')})."
+                        return render_template('index.html', data={}, error=error, google_api_key=GOOGLE_API_KEY)
+                else:
+                    # 4) No bias at all, final fallback: geocode the raw text
+                    g = geocode_address(facility_input)
+                    if g.get('status') != 'OK':
+                        error = f"No facility found (FindPlace: {fp.get('status')}, TextSearch: {ts.get('status')}, Geocode: {g.get('status')})."
+                        return render_template('index.html', data={}, error=error, google_api_key=GOOGLE_API_KEY)
+                    r0 = g['results'][0]
+                    addr = r0['formatted_address']
+                    lat  = r0['geometry']['location']['lat']
+                    lng  = r0['geometry']['location']['lng']
+                    place = {}
+        else:
+            # Address-only flow (unchanged)
+            g = geocode_address(addr_input)
+            if g.get('status') != 'OK':
+                error = f"Geocode failed: {g.get('status')}"
+                return render_template('index.html', data={}, error=error, google_api_key=GOOGLE_API_KEY)
+            r0 = g['results'][0]
+            addr = r0['formatted_address']
+            lat  = r0['geometry']['location']['lat']
+            lng  = r0['geometry']['location']['lng']
+
+            # Attach a nearby storage business like before
+            fp = places_findplace(f"self storage near {addr}")
+            if fp.get('candidates'):
+                pid = fp['candidates'][0]['place_id']
+                det = fetch_place_details(pid)
+                place = det.get('result', {})
+
+        # County via reverse geocode
+        county = "Unknown"
+        try:
+            rev = reverse_geocode(lat, lng)
+            if rev.get('results'):
+                comps = rev['results'][0].get('address_components', [])
                 county = next(
                     (c['long_name'].replace(' County','')
                      for c in comps if 'administrative_area_level_2' in c['types']),
                     'Unknown'
                 )
+        except:
+            pass
 
-                # Google Place
-                find_res = requests.get(
-                    "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                    params={
-                        'input': facility_input if facility_input else f"self storage near {addr}",
-                        'inputtype': 'textquery',
-                        'fields': 'place_id',
-                        'key': GOOGLE_API_KEY
-                    }
-                ).json()
-                place = {}
-                if find_res.get('candidates'):
-                    pid = find_res['candidates'][0]['place_id']
-                    place = requests.get(
-                        "https://maps.googleapis.com/maps/api/place/details/json",
-                        params={
-                            'place_id': pid,
-                            'fields': 'name,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews,photos',
-                            'key': GOOGLE_API_KEY
-                        }
-                    ).json().get('result', {})
+        # Remaining modules
+        cad    = get_cad_details(county, addr)
+        llc    = get_llc_info(cad.get('owner_name',''))
+        owner  = get_owner_profile(llc.get('llc_name',''))
+        market = get_market_comps(lat, lng)
 
-                # CAD, LLC & owner, market comps
-                cad    = get_cad_details(county, addr)
-                llc    = get_llc_info(cad.get('owner_name',''))
-                owner  = get_owner_profile(llc.get('llc_name',''))
-                market = get_market_comps(lat, lng)
+        # Static example scoring (unchanged)
+        asking, income, expenses, nrsf = 1_200_000, 15_000, 5_000, 20_000
+        noi   = (income - expenses) * 12
+        cap   = round(noi / asking * 100, 2)
+        ppsf  = round(asking / nrsf, 2)
+        score_val = (cap >= 7) + (ppsf < 75) + (asking < (noi / 0.07))
+        score_labels = ['Pass', 'Weak', 'Explore', 'Strong']
+        score = score_labels[min(3, score_val)]
 
-                # Deal scoring (static example)
-                asking, income, expenses, nrsf = 1_200_000, 15_000, 5_000, 20_000
-                noi   = (income - expenses) * 12
-                cap   = round(noi / asking * 100, 2)
-                ppsf  = round(asking / nrsf, 2)
-                score_val = (cap >= 7) + (ppsf < 75) + (asking < (noi / 0.07))
-                score_labels = ['Pass', 'Weak', 'Explore', 'Strong']
-                score = score_labels[min(3, score_val)]
-
-                data = {
-                    'address': addr,
-                    'lat':      lat,
-                    'lng':      lng,
-                    'county':   county,
-                    'place':    place,
-                    'cad':      cad,
-                    'llc':      llc,
-                    'owner':    owner,
-                    'market':   market,
-                    'cap':      cap,
-                    'ppsf':     ppsf,
-                    'score':    score
-                }
+        data = {
+            'address': addr,
+            'lat':      lat,
+            'lng':      lng,
+            'county':   county,
+            'place':    place,
+            'cad':      cad,
+            'llc':      llc,
+            'owner':    owner,
+            'market':   market,
+            'cap':      cap,
+            'ppsf':     ppsf,
+            'score':    score
+        }
 
     return render_template('index.html',
                            data=data,
@@ -216,4 +328,5 @@ def index():
 
 if __name__ == '__main__':
     app.run(debug=True)
+
 
