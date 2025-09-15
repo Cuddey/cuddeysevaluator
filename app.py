@@ -1,22 +1,17 @@
-# app.py
 import os
-import time
-import math
-import re
 from flask import Flask, render_template, request
 import requests
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-from googlesearch import search
-from requests.exceptions import ReadTimeout
+import math
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
 
 app = Flask(__name__)
 
-# 1) CAD Scrapers for Texas appraisal districts
+# --- 1) Multi-County CAD Scrapers ---
 def tarrant_cad(address):
     url = f"https://www.tad.org/property-search-results/?searchtext={quote_plus(address)}"
     html = requests.get(url, timeout=10).text
@@ -37,42 +32,30 @@ def tarrant_cad(address):
     }
 
 def dallas_cad(address):
-    url = f"https://www.dallascad.org/SearchOwner.aspx?searchTerm={quote_plus(address)}"
-    html = requests.get(url, timeout=10).text
-    soup = BeautifulSoup(html, 'html.parser')
-    table = soup.find('table', id='Grid')
-    if not table or len(table.find_all('tr')) < 2:
-        return {}
-    cols = table.find_all('tr')[1].find_all('td')
-    return {
-        'tax_id': cols[0].get_text(strip=True) or 'N/A',
-        'owner_name': cols[1].get_text(strip=True) or 'N/A',
-        'mailing_address': cols[2].get_text(strip=True) or 'N/A'
-    }
+    return {'link': f"https://www.dallascad.org/SearchOwner.aspx?searchTerm={quote_plus(address)}"}
 
-def harris_cad(address): return {}
-def bexar_cad(address):  return {}
-def travis_cad(address): return {}
+def harris_cad(address):
+    return {'link': f"https://hcad.org/property-search/?searchType=address&searchTerm={quote_plus(address)}"}
+
+def bexar_cad(address):
+    return {'link': f"https://bexar.trueautomation.com/clientdb/?cid=1&unit=property&tab=search&address={quote_plus(address)}"}
+
+def travis_cad(address):
+    return {'link': f"https://propaccess.traviscad.org/clientdb/?cid=1&unit=property&tab=search&address={quote_plus(address)}"}
 
 cad_modules = {
     'tarrant': tarrant_cad,
-    'dallas':  dallas_cad,
-    'harris':  harris_cad,
-    'bexar':   bexar_cad,
-    'travis':  travis_cad
+    'dallas': dallas_cad,
+    'harris': harris_cad,
+    'bexar':  bexar_cad,
+    'travis': travis_cad
 }
 
-def get_cad_details(county, state, address):
+def get_cad_details(county, address):
     func = cad_modules.get(county.lower())
-    if func:
-        data = func(address)
-        if data:
-            return data
-    query = quote_plus(f"{county} {state} Appraisal District property search")
-    return {'link': f"https://www.google.com/search?q={query}"}
+    return func(address) if func else {}
 
-
-# 2) LLC Tracing via OpenCorporates
+# --- 2) LLC & Entity Tracing ---
 def get_llc_info(owner_name):
     if not owner_name:
         return {}
@@ -81,10 +64,10 @@ def get_llc_info(owner_name):
             "https://api.opencorporates.com/v0.4/companies/search",
             params={'q': owner_name, 'jurisdiction_code': 'us_tx'}
         ).json()
-        comps = oc.get('results', {}).get('companies', [])
-        if not comps:
+        candidates = oc.get('results', {}).get('companies', [])
+        if not candidates:
             return {}
-        comp = comps[0]['company']
+        comp = candidates[0]['company']
         num = comp.get('company_number')
         return {
             'llc_name': comp.get('name'),
@@ -95,229 +78,142 @@ def get_llc_info(owner_name):
     except:
         return {}
 
-
-# 3) Owner Profile stub and online search
+# --- 3) Human-Level Owner Lookup (stub) ---
 def get_owner_profile(llc_name):
+    # Placeholder – replace with real scrapes or API calls
     return {
-        'linkedIn': 'N/A',
-        'facebook': 'N/A',
-        'emails': [],
-        'phones': [],
+        'linkedIn':     'N/A',
+        'facebook':     'N/A',
+        'emails':       [],
+        'phones':       [],
         'other_businesses': []
     }
 
-def search_owner_online(owner_name, address):
-    query = owner_name or address
-    results = []
-    try:
-        for url in search(query, num_results=3, pause=2):
-            html = requests.get(url, timeout=5).text
-            soup = BeautifulSoup(html, 'html.parser')
-            title = soup.title.string if soup.title else url
-            desc_tag = soup.find('meta', attrs={'name': 'description'})
-            description = desc_tag['content'] if desc_tag and desc_tag.get('content') else ''
-            emails = list(set(re.findall(r'[A-Za-z0-9.+_-]+@[A-Za-z0-9._-]+\.[A-Za-z]+', html)))
-            phones = list(set(re.findall(r'\(?\d{3}\)?\s*\d{3}\s*\d{4}', html)))
-            results.append({
-                'url': url,
-                'title': title,
-                'description': description,
-                'emails': emails,
-                'phones': phones
-            })
-    except:
-        pass
-    return results
-
-
-# 4) Market and competition via Google Places
-def nearby_storage(lat, lng, radius_m):
-    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    params = {
-        'location': f"{lat},{lng}",
-        'radius': int(radius_m),
-        'type': 'storage',
-        'key': GOOGLE_API_KEY
-    }
-    all_fac = []
-    while True:
-        res = requests.get(url, params=params).json()
-        all_fac.extend(res.get('results', []))
-        token = res.get('next_page_token')
-        if not token:
-            break
-        time.sleep(2)
-        params = {'pagetoken': token, 'key': GOOGLE_API_KEY}
-    return all_fac
-
+# --- 4) Market & Competition Module (5- and 10-mile radii, all results) ---
 def get_market_comps(lat, lng):
-    def compute(rad):
-        facs = nearby_storage(lat, lng, rad)
-        comps = [{
-            'place_id': f.get('place_id'),
-            'name':     f.get('name'),
-            'rating':   f.get('rating'),
-            'reviews':  f.get('user_ratings_total'),
-            'vicinity': f.get('vicinity'),
-            'lat':      f['geometry']['location']['lat'],
-            'lng':      f['geometry']['location']['lng']
-        } for f in facs]
-        count = len(comps)
-        area = math.pi * (rad / 1609.34) ** 2
-        dens  = round(count / area, 2) if area else 0
-        return comps, count, dens
-
-    c5, cnt5, d5    = compute(5 * 1609.34)
-    c10, cnt10, d10 = compute(10 * 1609.34)
-    ids5 = {c['place_id'] for c in c5}
-    new10 = [c for c in c10 if c['place_id'] not in ids5]
-    return {
-        'competitors_5':  c5,
-        'count_5':        cnt5,
-        'density_5':      d5,
-        'competitors_10': new10,
-        'count_10':       cnt10,
-        'density_10':     d10
-    }
-
-
-# 5) Comparables scrapers (REPLACED) – Google-search + regex parsing
-def get_surrounding_listings(lat, lng, addr):
-    listings = []
-    query = f"self storage for sale near {addr}"
-    for url in search(query, num_results=5, pause=2):
-        parsed = urlparse(url)
-        domain = parsed.netloc.replace('www.', '')
-        if 'crexi.com' not in domain and 'loopnet.com' not in domain:
-            continue
-        try:
-            html = requests.get(url, timeout=5).text
-            name_tag = BeautifulSoup(html, 'html.parser').title
-            title = name_tag.string.strip() if name_tag else domain
-            price_m = re.search(r'\$\s?([\d,]+)', html)
-            size_m  = re.search(r'([\d,]+)\s*(?:sq\.?\s*ft|SF)', html)
-            price = int(price_m.group(1).replace(',', '')) if price_m else 0
-            size  = int(size_m.group(1).replace(',', '')) if size_m else 0
-            ppsf  = round(price/size, 2) if price and size else 0
-            listings.append({
-                'source': domain,
-                'name':   title,
-                'nrsf':   size,
-                'price':  price,
-                'ppsf':   ppsf,
-                'link':   url
+    def fetch(radius_m):
+        res = requests.get(
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+            params={
+                'location': f"{lat},{lng}",
+                'radius': int(radius_m),
+                'type': 'storage',
+                'key': GOOGLE_API_KEY
+            }
+        ).json()
+        comps = []
+        # include all results, no slicing
+        for r in res.get('results', []):
+            comps.append({
+                'name':    r.get('name'),
+                'rating':  r.get('rating'),
+                'reviews': r.get('user_ratings_total'),
+                'vicinity':r.get('vicinity')
             })
-        except (ReadTimeout, Exception):
-            continue
-    return listings
+        area_sq_mi = math.pi * (radius_m / 1609.34) ** 2
+        density = (len(res.get('results', [])) / area_sq_mi) if area_sq_mi else 0
+        return comps, round(density, 2)
 
-
-# 6) Tax history stub
-def get_tax_history(address):
-    return [
-        {'year': 2023, 'tax': 3200},
-        {'year': 2022, 'tax': 3000},
-        {'year': 2021, 'tax': 2800}
-    ]
-
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    data = {
-        'address': '', 'lat': 0, 'lng': 0,
-        'county': '', 'state': '',
-        'place': {}, 'cad': {}, 'llc': {}, 'owner': {}, 'owner_web': [],
-        'market': {'competitors_5': [], 'count_5': 0, 'density_5': 0,
-                   'competitors_10': [], 'count_10': 0, 'density_10': 0},
-        'cap': 0, 'ppsf': 0, 'score': '',
-        'nrsf': 0, 'listings': [], 'recommended_ppsf': 0,
-        'recommended_value': 0, 'tax_records': [], 'avg_tax': 0
+    comps5, density5   = fetch(5 * 1609.34)
+    comps10, density10 = fetch(10 * 1609.34)
+    return {
+        'competitors_5':  comps5,
+        'density_5':      density5,
+        'competitors_10': comps10,
+        'density_10':     density10
     }
+
+@app.route('/', methods=['GET','POST'])
+def index():
+    data = {}
     error = None
 
     if request.method == 'POST':
-        addr_in = request.form.get('query', '').strip()
-        fac_in  = request.form.get('facility', '').strip()
-        if not addr_in and not fac_in:
-            error = "Enter address or facility name."
+        addr_input     = request.form.get('query', '').strip()
+        facility_input = request.form.get('facility', '').strip()
+
+        if not addr_input and not facility_input:
+            error = "Please enter an address or facility name."
         else:
-            q   = fac_in or addr_in
-            geo = requests.get(
+            query = facility_input or addr_input
+
+            # Geocode
+            geo_res = requests.get(
                 "https://maps.googleapis.com/maps/api/geocode/json",
-                params={'address': q, 'key': GOOGLE_API_KEY}
+                params={'address': query, 'key': GOOGLE_API_KEY}
             ).json()
 
-            if geo.get('status') != 'OK':
-                error = "Geocode error: " + geo.get('status', '')
+            if geo_res.get('status') != 'OK':
+                error = f"Geocode failed: {geo_res.get('status')}"
             else:
-                r0    = geo['results'][0]
-                addr  = r0['formatted_address']
-                lat   = r0['geometry']['location']['lat']
-                lng   = r0['geometry']['location']['lng']
-                comps = r0['address_components']
-                county = next((c['long_name'].replace(' County','')
-                               for c in comps if 'administrative_area_level_2' in c['types']), 'Unknown')
-                state  = next((c['short_name']
-                               for c in comps if 'administrative_area_level_1' in c['types']), '')
+                result = geo_res['results'][0]
+                addr  = result['formatted_address']
+                lat   = result['geometry']['location']['lat']
+                lng   = result['geometry']['location']['lng']
+                comps = result['address_components']
+                county = next(
+                    (c['long_name'].replace(' County','')
+                     for c in comps if 'administrative_area_level_2' in c['types']),
+                    'Unknown'
+                )
 
-                fp = requests.get(
+                # Google Place
+                find_res = requests.get(
                     "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
                     params={
-                        'input': fac_in or f"self storage near {addr}",
+                        'input': facility_input if facility_input else f"self storage near {addr}",
                         'inputtype': 'textquery',
                         'fields': 'place_id',
                         'key': GOOGLE_API_KEY
                     }
                 ).json()
-
                 place = {}
-                if fp.get('candidates'):
-                    pid = fp['candidates'][0]['place_id']
+                if find_res.get('candidates'):
+                    pid = find_res['candidates'][0]['place_id']
                     place = requests.get(
                         "https://maps.googleapis.com/maps/api/place/details/json",
                         params={
                             'place_id': pid,
-                            'fields': 'name,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews',
+                            'fields': 'name,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews,photos',
                             'key': GOOGLE_API_KEY
                         }
                     ).json().get('result', {})
 
-                cad       = get_cad_details(county, state, addr)
-                llc       = get_llc_info(cad.get('owner_name', ''))
-                owner     = get_owner_profile(llc.get('llc_name', ''))
-                owner_web = search_owner_online(cad.get('owner_name', '') or addr_in, addr)
-                market    = get_market_comps(lat, lng)
+                # CAD, LLC & owner, market comps
+                cad    = get_cad_details(county, addr)
+                llc    = get_llc_info(cad.get('owner_name',''))
+                owner  = get_owner_profile(llc.get('llc_name',''))
+                market = get_market_comps(lat, lng)
 
-                ask, inc, exp, nrsf = 1_200_000, 15_000, 5_000, 20_000
-                noi  = (inc - exp) * 12
-                cap  = round(noi / ask * 100, 2)
-                ppsf = round(ask / nrsf, 2)
-                sv   = (cap >= 7) + (ppsf < 75) + (ask < (noi / 0.07))
-                score = ['Pass', 'Weak', 'Explore', 'Strong'][min(3, sv)]
+                # Deal scoring (static example)
+                asking, income, expenses, nrsf = 1_200_000, 15_000, 5_000, 20_000
+                noi   = (income - expenses) * 12
+                cap   = round(noi / asking * 100, 2)
+                ppsf  = round(asking / nrsf, 2)
+                score_val = (cap >= 7) + (ppsf < 75) + (asking < (noi / 0.07))
+                score_labels = ['Pass', 'Weak', 'Explore', 'Strong']
+                score = score_labels[min(3, score_val)]
 
-                # only change below
-                listings    = get_surrounding_listings(lat, lng, addr)
-                avg_ppsf    = round(sum(l['ppsf'] for l in listings) / len(listings), 2) if listings else 0
-                rec_value   = round(avg_ppsf * nrsf, 2) if listings else 0
+                data = {
+                    'address': addr,
+                    'lat':      lat,
+                    'lng':      lng,
+                    'county':   county,
+                    'place':    place,
+                    'cad':      cad,
+                    'llc':      llc,
+                    'owner':    owner,
+                    'market':   market,
+                    'cap':      cap,
+                    'ppsf':     ppsf,
+                    'score':    score
+                }
 
-                taxes       = get_tax_history(addr)
-                avg_tax     = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
-
-                data.update({
-                    'address': addr, 'lat': lat, 'lng': lng,
-                    'county': county, 'state': state,
-                    'place': place, 'cad': cad, 'llc': llc,
-                    'owner': owner, 'owner_web': owner_web,
-                    'market': market, 'cap': cap, 'ppsf': ppsf,
-                    'score': score, 'nrsf': nrsf,
-                    'listings': listings,
-                    'recommended_ppsf': avg_ppsf,
-                    'recommended_value': rec_value,
-                    'tax_records': taxes,
-                    'avg_tax': avg_tax
-                })
-
-    return render_template('index.html', data=data, error=error, google_api_key=GOOGLE_API_KEY)
+    return render_template('index.html',
+                           data=data,
+                           error=error,
+                           google_api_key=GOOGLE_API_KEY)
 
 if __name__ == '__main__':
     app.run(debug=True)
+
