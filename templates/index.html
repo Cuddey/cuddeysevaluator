@@ -1,275 +1,146 @@
-import os
-from flask import Flask, render_template, request
-import requests
-from urllib.parse import quote_plus
-from dotenv import load_dotenv
-from bs4 import BeautifulSoup
-import math
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>📦 Cuddeys Deal Finder</title>
+  <script src="https://maps.googleapis.com/maps/api/js?key={{ google_api_key }}&libraries=places"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    input, button { padding: 8px; margin: 6px 0; width: 100%; max-width: 400px; }
+    #map, #streetview { width: 100%; height: 400px; margin-bottom: 20px; }
+    h2, h3 { margin-top: 24px; }
+    ul { list-style: none; padding-left: 0; }
+    li { margin-bottom: 6px; }
+    pre { background: #f4f4f4; padding: 10px; }
+    .error { color: red; }
+  </style>
+</head>
+<body>
+  <h1>📦 Cuddeys Deal Finder</h1>
 
-load_dotenv()
-GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
+  <form method="post">
+    <input
+      type="text"
+      name="query"
+      placeholder="Property Address (optional)"
+      value="{{ request.form.query or '' }}"
+    >
+    <input
+      type="text"
+      name="facility"
+      placeholder="Facility Name (optional)"
+      value="{{ request.form.facility or '' }}"
+    >
+    <button type="submit">Search</button>
+  </form>
 
-app = Flask(__name__)
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
 
-# 1) Multi County CAD Scrapers
-def tarrant_cad(address):
-    url = f"https://www.tad.org/property-search-results/?searchtext={quote_plus(address)}"
-    html = requests.get(url, timeout=10).text
-    soup = BeautifulSoup(html, 'html.parser')
-    link = soup.select_one('a.property-listing')
-    if not link:
-        return {}
-    detail_url = "https://www.tad.org" + link['href']
-    detail_html = requests.get(detail_url, timeout=10).text
-    dsoup = BeautifulSoup(detail_html, 'html.parser')
-    owner = dsoup.find('h4', text='Owner')
-    tax   = dsoup.find('h4', text='Account #')
-    mail  = dsoup.find('h4', text='Mailing Address')
-    return {
-        'owner_name': owner.find_next_sibling('p').get_text(strip=True) if owner else 'N/A',
-        'tax_id':     tax.find_next_sibling('p').get_text(strip=True)   if tax   else 'N/A',
-        'mailing_address': mail.find_next_sibling('p').get_text(strip=True) if mail else 'N/A'
-    }
+  {% if data.address %}
+    <p>📍 Location: {{ data.address }}</p>
+    <p>🏛 County: {{ data.county }}</p>
 
-def dallas_cad(address):
-    return {'link': f"https://www.dallascad.org/SearchOwner.aspx?searchTerm={quote_plus(address)}"}
+    <div id="map"></div>
+    <div id="streetview"></div>
+    <script>
+      var center = { lat: {{ data.lat }}, lng: {{ data.lng }} };
+      var map = new google.maps.Map(
+        document.getElementById('map'),
+        { center: center, zoom: 14 }
+      );
+      new google.maps.StreetViewPanorama(
+        document.getElementById('streetview'),
+        { position: center, pov: { heading: 165, pitch: 0 }, zoom: 1 }
+      );
+    </script>
 
-def harris_cad(address):
-    return {'link': f"https://hcad.org/property-search/?searchType=address&searchTerm={quote_plus(address)}"}
+    <h2>🏢 Google Business Profile</h2>
+    {% if data.place %}
+      <p><strong>Name:</strong> {{ data.place.name }}</p>
+      <p><strong>Phone:</strong> {{ data.place.formatted_phone_number or 'N/A' }}</p>
+      <p><strong>Website:</strong>
+        {% if data.place.website %}
+          <a href="{{ data.place.website }}" target="_blank">{{ data.place.website }}</a>
+        {% else %}
+          N/A
+        {% endif %}
+      </p>
+      <p><strong>Rating:</strong> {{ data.place.rating or 'N/A' }} ⭐ ({{ data.place.user_ratings_total or 0 }} reviews)</p>
+      {% if data.place.opening_hours %}
+        <p><strong>Hours:</strong></p>
+        <ul>
+          {% for line in data.place.opening_hours.weekday_text %}
+            <li>{{ line }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+      {% if data.place.reviews %}
+        <h3>📝 Recent Reviews</h3>
+        <ul>
+          {% for r in data.place.reviews %}
+            <li>"{{ r.text }}" – {{ r.author_name }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% else %}
+      <p>No business profile found</p>
+    {% endif %}
 
-def bexar_cad(address):
-    return {'link': f"https://bexar.trueautomation.com/clientdb/?cid=1&unit=property&tab=search&address={quote_plus(address)}"}
+    <h2>📋 CAD Records</h2>
+    <p><strong>Owner:</strong> {{ data.cad.owner_name }}</p>
+    <p><strong>Tax ID:</strong> {{ data.cad.tax_id }}</p>
+    <p><strong>Mailing Address:</strong> {{ data.cad.mailing_address }}</p>
 
-def travis_cad(address):
-    return {'link': f"https://propaccess.traviscad.org/clientdb/?cid=1&unit=property&tab=search&address={quote_plus(address)}"}
+    <h2>🗂 LLC Information</h2>
+    <p><strong>Name:</strong> {{ data.llc.llc_name or 'N/A' }}</p>
+    <p><strong>Formation Date:</strong> {{ data.llc.formation_date or 'N/A' }}</p>
+    <p>
+      <strong>OpenCorporates:</strong>
+      {% if data.llc.opencorporates_url %}
+        <a href="{{ data.llc.opencorporates_url }}" target="_blank">Link</a>
+      {% else %}
+        N/A
+      {% endif %}
+    </p>
+    <p>
+      <strong>SOS:</strong>
+      {% if data.llc.sos_url %}
+        <a href="{{ data.llc.sos_url }}" target="_blank">Link</a>
+      {% else %}
+        N/A
+      {% endif %}
+    </p>
 
-cad_modules = {
-    'tarrant': tarrant_cad,
-    'dallas': dallas_cad,
-    'harris': harris_cad,
-    'bexar':  bexar_cad,
-    'travis': travis_cad
-}
+    <h2>👤 Owner Profile</h2>
+    <pre>{{ data.owner }}</pre>
 
-def get_cad_details(county, address):
-    func = cad_modules.get(county.lower())
-    return func(address) if func else {}
+    <h2>💰 Deal Metrics</h2>
+    <p>Cap Rate: {{ data.cap }}%</p>
+    <p>Price per SF: ${{ data.ppsf }}</p>
+    <p>Score: {{ data.score }}</p>
 
-# 2) LLC and Entity Tracing
-def get_llc_info(owner_name):
-    if not owner_name:
-        return {}
-    try:
-        oc = requests.get(
-            "https://api.opencorporates.com/v0.4/companies/search",
-            params={'q': owner_name, 'jurisdiction_code': 'us_tx'}
-        ).json()
-        candidates = oc.get('results', {}).get('companies', [])
-        if not candidates:
-            return {}
-        comp = candidates[0]['company']
-        num = comp.get('company_number')
-        return {
-            'llc_name': comp.get('name'),
-            'formation_date': comp.get('incorporation_date'),
-            'opencorporates_url': comp.get('opencorporates_url'),
-            'sos_url': f"https://mycpa.cpa.state.tx.us/coa/servlet/DisplayAAE?reportingEntityId={num}"
-        }
-    except:
-        return {}
+    <h2>📊 Market Competition</h2>
+    <h3>Within 5 mile radius ({{ data.market.competitors_5|length }} found)</h3>
+    <ul>
+      {% for c in data.market.competitors_5 %}
+        <li>{{ c.name }} – {{ c.rating or 'N/A' }} ⭐, {{ c.reviews or 0 }} reviews ({{ c.vicinity }})</li>
+      {% endfor %}
+      {% if not data.market.competitors_5 %}
+        <li>No competitors found within 5 miles</li>
+      {% endif %}
+    </ul>
 
-# 3) Owner Profile stub
-def get_owner_profile(llc_name):
-    return {
-        'linkedIn':     'N/A',
-        'facebook':     'N/A',
-        'emails':       [],
-        'phones':       [],
-        'other_businesses': []
-    }
-
-# 4) Market and Competition Module with full results at 5 and 10 miles
-def get_market_comps(lat, lng):
-    def fetch(radius_m):
-        res = requests.get(
-            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
-            params={
-                'location': f"{lat},{lng}",
-                'radius': int(radius_m),
-                'type': 'storage',
-                'key': GOOGLE_API_KEY
-            }
-        ).json()
-        comps = []
-        for r in res.get('results', []):
-            comps.append({
-                'name':    r.get('name'),
-                'rating':  r.get('rating'),
-                'reviews': r.get('user_ratings_total'),
-                'vicinity':r.get('vicinity')
-            })
-        area_sq_mi = math.pi * (radius_m / 1609.34) ** 2
-        density = (len(res.get('results', [])) / area_sq_mi) if area_sq_mi else 0
-        return comps, round(density, 2)
-
-    comps5, density5   = fetch(5 * 1609.34)
-    comps10, density10 = fetch(10 * 1609.34)
-    return {
-        'competitors_5':  comps5,
-        'density_5':      density5,
-        'competitors_10': comps10,
-        'density_10':     density10
-    }
-
-@app.route('/', methods=['GET','POST'])
-def index():
-    data = {}
-    error = None
-
-    if request.method == 'POST':
-        addr_input     = request.form.get('query', '').strip()
-        facility_input = request.form.get('facility', '').strip()
-
-        if not addr_input and not facility_input:
-            error = "Please enter an address or facility name."
-        else:
-            # If a facility name is provided, use Places to resolve to a location
-            if facility_input:
-                find_res = requests.get(
-                    "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                    params={
-                        'input': facility_input,
-                        'inputtype': 'textquery',
-                        'fields': 'place_id,geometry,formatted_address,name',
-                        'key': GOOGLE_API_KEY
-                    }
-                ).json()
-
-                if find_res.get('candidates'):
-                    cand = find_res['candidates'][0]
-                    addr = cand.get('formatted_address', facility_input)
-                    geometry = cand.get('geometry', {})
-                    location = geometry.get('location', {})
-                    lat = location.get('lat')
-                    lng = location.get('lng')
-
-                    # Pull richer business details
-                    place = {}
-                    pid = cand.get('place_id')
-                    if pid:
-                        place = requests.get(
-                            "https://maps.googleapis.com/maps/api/place/details/json",
-                            params={
-                                'place_id': pid,
-                                'fields': 'name,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews,photos',
-                                'key': GOOGLE_API_KEY
-                            }
-                        ).json().get('result', {})
-
-                else:
-                    # Fall back to geocoding the text if no candidate returned
-                    geo_res = requests.get(
-                        "https://maps.googleapis.com/maps/api/geocode/json",
-                        params={'address': facility_input, 'key': GOOGLE_API_KEY}
-                    ).json()
-                    if geo_res.get('status') != 'OK':
-                        error = f"Geocode failed: {geo_res.get('status')}"
-                        return render_template('index.html', data={}, error=error, google_api_key=GOOGLE_API_KEY)
-                    result = geo_res['results'][0]
-                    addr  = result['formatted_address']
-                    lat   = result['geometry']['location']['lat']
-                    lng   = result['geometry']['location']['lng']
-                    place = {}
-
-            else:
-                # Address only flow, same as before
-                geo_res = requests.get(
-                    "https://maps.googleapis.com/maps/api/geocode/json",
-                    params={'address': addr_input, 'key': GOOGLE_API_KEY}
-                ).json()
-
-                if geo_res.get('status') != 'OK':
-                    error = f"Geocode failed: {geo_res.get('status')}"
-                    return render_template('index.html', data={}, error=error, google_api_key=GOOGLE_API_KEY)
-
-                result = geo_res['results'][0]
-                addr  = result['formatted_address']
-                lat   = result['geometry']['location']['lat']
-                lng   = result['geometry']['location']['lng']
-
-                # If you searched by address but want a nearby storage business name too
-                # keep the old behavior of trying a nearby storage place
-                place = {}
-                find_res = requests.get(
-                    "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                    params={
-                        'input': f"self storage near {addr}",
-                        'inputtype': 'textquery',
-                        'fields': 'place_id',
-                        'key': GOOGLE_API_KEY
-                    }
-                ).json()
-                if find_res.get('candidates'):
-                    pid = find_res['candidates'][0]['place_id']
-                    place = requests.get(
-                        "https://maps.googleapis.com/maps/api/place/details/json",
-                        params={
-                            'place_id': pid,
-                            'fields': 'name,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews,photos',
-                            'key': GOOGLE_API_KEY
-                        }
-                    ).json().get('result', {})
-
-            # County from geocode components
-            county = "Unknown"
-            try:
-                # fetch components again via reverse geocode for consistency
-                rev = requests.get(
-                    "https://maps.googleapis.com/maps/api/geocode/json",
-                    params={'latlng': f"{lat},{lng}", 'key': GOOGLE_API_KEY}
-                ).json()
-                if rev.get('results'):
-                    comps = rev['results'][0].get('address_components', [])
-                    county = next(
-                        (c['long_name'].replace(' County','')
-                         for c in comps if 'administrative_area_level_2' in c['types']),
-                        'Unknown'
-                    )
-            except:
-                pass
-
-            cad    = get_cad_details(county, addr)
-            llc    = get_llc_info(cad.get('owner_name',''))
-            owner  = get_owner_profile(llc.get('llc_name',''))
-            market = get_market_comps(lat, lng)
-
-            asking, income, expenses, nrsf = 1_200_000, 15_000, 5_000, 20_000
-            noi   = (income - expenses) * 12
-            cap   = round(noi / asking * 100, 2)
-            ppsf  = round(asking / nrsf, 2)
-            score_val = (cap >= 7) + (ppsf < 75) + (asking < (noi / 0.07))
-            score_labels = ['Pass', 'Weak', 'Explore', 'Strong']
-            score = score_labels[min(3, score_val)]
-
-            data = {
-                'address': addr,
-                'lat':      lat,
-                'lng':      lng,
-                'county':   county,
-                'place':    locals().get('place', {}),
-                'cad':      cad,
-                'llc':      llc,
-                'owner':    owner,
-                'market':   market,
-                'cap':      cap,
-                'ppsf':     ppsf,
-                'score':    score
-            }
-
-    return render_template('index.html',
-                           data=data,
-                           error=error,
-                           google_api_key=GOOGLE_API_KEY)
-
-if __name__ == '__main__':
-    app.run(debug=True)
+    <h3>Within 10 mile radius ({{ data.market.competitors_10|length }} found)</h3>
+    <ul>
+      {% for c in data.market.competitors_10 %}
+        <li>{{ c.name }} – {{ c.rating or 'N/A' }} ⭐, {{ c.reviews or 0 }} reviews ({{ c.vicinity }})</li>
+      {% endfor %}
+      {% if not data.market.competitors_10 %}
+        <li>No competitors found within 10 miles</li>
+      {% endif %}
+    </ul>
+  {% endif %}
+</body>
+</html>
