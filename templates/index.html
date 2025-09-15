@@ -4,6 +4,23 @@
   <meta charset="utf-8">
   <title>Cuddeys Deal Finder</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    /* --- minimal inline styles to make the rates section readable --- */
+    .card { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:16px; margin:12px 0; }
+    .card h4 { margin:0 0 8px 0; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:12px; font-size:12px; color:#111; background:#e5f3ff; border:1px solid #cfe7ff; }
+    .table-clean { width:100%; border-collapse:collapse; font-size:14px; }
+    .table-clean th { text-align:left; background:#f8fafc; color:#111827; border-bottom:1px solid #e5e7eb; padding:8px; }
+    .table-clean td { border-bottom:1px solid #f1f5f9; padding:8px; vertical-align:top; }
+    .muted { color:#6b7280; }
+    .ok { color:#065f46; font-weight:600; }
+    .warn { color:#9a3412; font-weight:600; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:12px; }
+    @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr; } }
+    .pill { font-size:12px; padding:2px 8px; border-radius:10px; border:1px solid #e5e7eb; background:#f9fafb; }
+    .subtle { color:#111827; background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; border-radius:6px; display:inline-block; }
+    .section-title { margin-top:18px; }
+  </style>
 </head>
 <body>
   <div class="container">
@@ -160,75 +177,92 @@
         <p>No nearby listings found.</p>
       {% endif %}
 
-      <!-- === NEW: Competitor Rates Comparison === -->
-      <h3>📊 Competitor Rates Comparison</h3>
-      {% if data.rate_analysis and data.rate_analysis|length > 0 %}
-        <p><em>Subject website scraped:</em>
-          {% if data.place.website %}
-            <a href="{{ data.place.website }}" target="_blank">{{ data.place.website }}</a>
-          {% else %}
-            (not available)
-          {% endif %}
-        </p>
+      <!-- === NEW: Competitor Rates Comparison (organized + color cues) === -->
+      <h3 class="section-title">📊 Competitor Rates Comparison</h3>
 
-        <table>
+      {% set sizes = ['5x5','5x10','10x10','10x15','10x20','10x30'] %}
+
+      <div class="card">
+        <h4>Subject Property Rates</h4>
+        {% if data.place.name %}
+          <div class="muted">{{ data.place.name }} {% if data.place.website %}· <a href="{{ data.place.website }}" target="_blank">website</a>{% endif %}</div>
+        {% endif %}
+        <table class="table-clean">
           <tr>
             <th>Unit Size</th>
-            <th>Subject Rate</th>
-            <th>Avg Competitor</th>
-            <th>Max Competitor</th>
-            <th>Potential ↑</th>
-            <th>All Competitor Rates</th>
+            <th>Climate</th>
+            <th>Non-Climate</th>
           </tr>
-          {% for size, r in data.rate_analysis.items() %}
+          {% for s in sizes %}
             <tr>
-              <td>{{ size }}</td>
-              <td>
-                {% if r.subject is not none %}${{ "{:,.0f}".format(r.subject) }}{% else %}N/A{% endif %}
-              </td>
-              <td>${{ "{:,.0f}".format(r.competitor_avg) }}</td>
-              <td>${{ "{:,.0f}".format(r.competitor_max) }}</td>
-              <td>{{ r.increase_pct }}%</td>
-              <td>
-                {% if r.competitor_rates %}
-                  {% for price in r.competitor_rates %}
-                    ${{ "{:,.0f}".format(price) }}{% if not loop.last %}, {% endif %}
-                  {% endfor %}
-                {% else %}
-                  —
-                {% endif %}
-              </td>
+              <td><span class="pill">{{ s }}</span></td>
+              <td>{% set v = data.subject_rates.get(s, {}).get('climate') %}{{ ('$' + "{:,.0f}".format(v)) if v is not none else '—' }}</td>
+              <td>{% set v = data.subject_rates.get(s, {}).get('non_climate') %}{{ ('$' + "{:,.0f}".format(v)) if v is not none else '—' }}</td>
             </tr>
           {% endfor %}
         </table>
+      </div>
 
+      <div class="card">
+        <h4>Market Summary (within 5 miles)</h4>
+        <table class="table-clean">
+          <tr>
+            <th>Unit Size</th>
+            <th>Avg Comp (CC)</th>
+            <th>Max Comp (CC)</th>
+            <th>↑ Potential (vs Max CC)</th>
+            <th>Avg Comp (NC)</th>
+            <th>Max Comp (NC)</th>
+            <th>↑ Potential (vs Max NC)</th>
+          </tr>
+          {% for s in sizes %}
+            {% set row = data.rate_analysis.get(s, {}) %}
+            <tr>
+              <td><span class="pill">{{ s }}</span></td>
+              <td>${{ "{:,.0f}".format(row.get('comp_avg_climate', 0)) }}</td>
+              <td>${{ "{:,.0f}".format(row.get('comp_max_climate', 0)) }}</td>
+              {% set inc_cc = row.get('increase_pct_climate', 0) %}
+              <td class="{{ 'ok' if inc_cc>0 else 'muted' }}">{{ inc_cc }}%</td>
+              <td>${{ "{:,.0f}".format(row.get('comp_avg_non_climate', 0)) }}</td>
+              <td>${{ "{:,.0f}".format(row.get('comp_max_non_climate', 0)) }}</td>
+              {% set inc_nc = row.get('increase_pct_non_climate', 0) %}
+              <td class="{{ 'ok' if inc_nc>0 else 'muted' }}">{{ inc_nc }}%</td>
+            </tr>
+          {% endfor %}
+        </table>
+        <p class="muted" style="margin-top:8px;">↑ Potential compares your subject rate to the market’s highest detected rate for the same climate bucket.</p>
+      </div>
+
+      <div class="card">
+        <h4>Competitor Details</h4>
         {% if data.competitor_rates and data.competitor_rates|length > 0 %}
-          <details style="margin-top:10px;">
-            <summary>Show per-competitor rate sources</summary>
-            <ul>
-              {% for comp in data.competitor_rates %}
-                <li>
-                  <strong>{{ comp.name }}</strong>
-                  {% if comp.website %}
-                    – <a href="{{ comp.website }}" target="_blank">website</a>
-                  {% endif %}
-                  {% if comp.rates %}
-                    <ul>
-                      {% for k, v in comp.rates.items() %}
-                        <li>{{ k }}: ${{ "{:,.0f}".format(v) }}</li>
-                      {% endfor %}
-                    </ul>
-                  {% else %}
-                    (no rates detected)
-                  {% endif %}
-                </li>
-              {% endfor %}
-            </ul>
-          </details>
+          <div class="grid">
+            {% for comp in data.competitor_rates %}
+              <div class="subtle">
+                <div><strong>{{ comp.name }}</strong></div>
+                <div class="muted">{{ comp.vicinity }}</div>
+                {% if comp.website %}<div><a href="{{ comp.website }}" target="_blank">website</a></div>{% endif %}
+                {% if comp.rates %}
+                  <table class="table-clean" style="margin-top:8px;">
+                    <tr><th>Unit Size</th><th>Climate</th><th>Non-Climate</th></tr>
+                    {% for k, v in comp.rates.items() %}
+                      <tr>
+                        <td><span class="pill">{{ k }}</span></td>
+                        <td>{% if v.climate is not none %}${{ "{:,.0f}".format(v.climate) }}{% else %}—{% endif %}</td>
+                        <td>{% if v.non_climate is not none %}${{ "{:,.0f}".format(v.non_climate) }}{% else %}—{% endif %}</td>
+                      </tr>
+                    {% endfor %}
+                  </table>
+                {% else %}
+                  <div class="muted">No rates detected.</div>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="muted">No competitor rate pages could be detected.</p>
         {% endif %}
-      {% else %}
-        <p>No competitor rates could be detected yet.</p>
-      {% endif %}
+      </div>
       <!-- === END NEW === -->
 
       <h3>💲 Tax History</h3>
