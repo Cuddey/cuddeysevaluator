@@ -242,73 +242,117 @@ def get_surrounding_listings(lat, lng):
     return scrape_crexi(lat, lng) + scrape_loopnet(lat, lng)
 
 
-# === NEW: rate scraping helpers ===
-_UNIT_RE = re.compile(r'(\d{1,2})\s*[x×]\s*(\d{1,2})', re.IGNORECASE)
-_PRICE_RE = re.compile(r'\$?\s?(\d{2,4})(?:\.\d{2})?(?:\s*/\s*(?:mo|month))?', re.IGNORECASE)
+# === NEW: rate scraping (restricted sizes + climate detection + stricter matching) ===
+SIZE_WHITELIST = {"5x5", "5x10", "10x10", "10x15", "10x20", "10x30"}
+
+# match 5x5 / 5 x 5 / 10×20 etc.
+_UNIT_RE = re.compile(r'(?<!\d)(\d{1,2})\s*[x×]\s*(\d{1,2})(?!\d)', re.IGNORECASE)
+# prices like $59, 59/mo, $125.00 per month
+_PRICE_RE = re.compile(r'\$?\s?(\d{2,4})(?:\.\d{2})?\s*(?:/|\bper\b)?\s*(?:mo|month|monthly)?', re.IGNORECASE)
+# hints that it's a monthly rental rate (avoid setup fees, deposits)
+_RATE_HINTS = re.compile(r'(rate|rent|monthly|per\s*month|/mo|special)', re.IGNORECASE)
+# climate control keywords
+_CC_POS = re.compile(r'(climate|climatized|temperature|temp[-\s]*controlled|a/c|air\s*conditioned)', re.IGNORECASE)
+_CC_NEG = re.compile(r'(non[-\s]*climate|non[-\s]*climatized|drive[-\s]*up|standard)', re.IGNORECASE)
 
 def _normalize_size(w, l):
     try:
         w = int(w); l = int(l)
-        return f"{w}x{l}"
     except:
-        return f"{w}x{l}"
+        pass
+    size = f"{w}x{l}"
+    return size if size in SIZE_WHITELIST else None
 
 def _find_rates_in_text(text):
     """
-    Scan raw text for patterns like '5x5 ... $59', '10 x 20 - $150', etc.
-    Returns dict size -> list of prices (floats).
+    Returns dict:
+      { size: { 'climate': price_or_None, 'non_climate': price_or_None } }
+    Keeps the LOWEST advertised price found for each bucket.
     """
-    rates = {}
+    out = {}
+    # scan through all size mentions; use a local context window
     for m in _UNIT_RE.finditer(text):
         size = _normalize_size(m.group(1), m.group(2))
-        # search near the unit size (local window)
-        start = max(m.start() - 100, 0)
-        end   = min(m.end() + 200, len(text))
+        if not size:
+            continue
+        start = max(m.start() - 150, 0)
+        end   = min(m.end() + 250, len(text))
         window = text[start:end]
-        prices = _PRICE_RE.findall(window)
-        for p in prices:
-            val = float(p)
-            if 10 <= val <= 2000:  # plausible monthly rate
-                rates.setdefault(size, []).append(val)
-    return rates
+
+        # we only consider windows that look like rate language
+        if not _RATE_HINTS.search(window):
+            continue
+
+        is_cc = _CC_POS.search(window) is not None
+        is_non = _CC_NEG.search(window) is not None
+        bucket = 'climate' if is_cc and not is_non else ('non_climate' if is_non and not is_cc else None)
+
+        # collect prices in the window
+        candidates = []
+        for p in _PRICE_RE.findall(window):
+            try:
+                val = float(p)
+                # plausible monthly self storage band
+                if 15 <= val <= 1000:
+                    candidates.append(val)
+            except:
+                continue
+        if not candidates:
+            continue
+        price = min(candidates)
+
+        out.setdefault(size, {'climate': None, 'non_climate': None})
+        if bucket == 'climate':
+            if out[size]['climate'] is None or price < out[size]['climate']:
+                out[size]['climate'] = price
+        elif bucket == 'non_climate':
+            if out[size]['non_climate'] is None or price < out[size]['non_climate']:
+                out[size]['non_climate'] = price
+        else:
+            # if indeterminate, prefer to fill whichever is empty
+            if out[size]['non_climate'] is None:
+                out[size]['non_climate'] = price
+            elif out[size]['climate'] is None:
+                out[size]['climate'] = price
+            else:
+                # keep the lowest of the two if this is smaller
+                if price < min(out[size]['climate'], out[size]['non_climate']):
+                    # replace the higher one to keep min signal
+                    if out[size]['climate'] >= out[size]['non_climate']:
+                        out[size]['climate'] = price
+                    else:
+                        out[size]['non_climate'] = price
+    return out
 
 def scrape_rates_from_website(url):
     """
-    Fetch a site and extract unit sizes + rates using regex.
-    Return dict size -> min advertised price (float).
+    Fetch site and extract unit sizes + rates using regex (whitelist sizes only).
+    Return dict size -> {'climate': price_or_None, 'non_climate': price_or_None}
     """
-    out = {}
     try:
         resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        txt = resp.text
-        # Also include visible text only to reduce noise
-        soup = BeautifulSoup(txt, 'html.parser')
+        soup = BeautifulSoup(resp.text, 'html.parser')
         visible = soup.get_text(separator=' ', strip=True)
-        combined = (txt[:200000] + " " + visible[:200000]).lower()  # cap to 200KB each
-        raw = _find_rates_in_text(combined)
-        for size, prices in raw.items():
-            out[size] = min(prices)  # lowest advertised
+        # cap text length to keep it fast and avoid false positives deep in scripts
+        combined = (visible[:250000]).lower()
+        return _find_rates_in_text(combined)
     except Exception:
-        pass
-    return out
+        return {}
 
 def discover_website_for(name, vicinity, fallback_query_suffix="storage units prices"):
-    """
-    Try to discover a website via Google if Places doesn't have one.
-    """
     query = f"{name} {vicinity} {fallback_query_suffix}"
     try:
         for url in search(query, num_results=3):
-            if any(t in url.lower() for t in [".com", ".net", ".org", ".storage", "units", "prices", "rates"]):
+            u = url.lower()
+            if any(t in u for t in [".com", ".net", ".org", ".storage"]) and not any(
+                b in u for b in ["facebook.com", "yelp.com", "google.com/maps", "bing.com"]
+            ):
                 return url
     except Exception:
         pass
     return None
 
 def get_place_website(place_id):
-    """
-    Use Places Details to get official website for a competitor place_id.
-    """
     try:
         res = requests.get(
             "https://maps.googleapis.com/maps/api/place/details/json",
@@ -319,29 +363,43 @@ def get_place_website(place_id):
     except Exception:
         return None
 
+def select_price_for_bucket(d, want_cc):
+    """Pick climate/non-climate depending on desired bucket; fall back gracefully."""
+    if not d:
+        return None
+    if want_cc:
+        return d.get('climate') or d.get('non_climate')
+    else:
+        return d.get('non_climate') or d.get('climate')
+
 def build_rate_analysis(subject_place, market):
     """
-    Scrape subject site + competitor sites (within 5mi) for unit rates.
-    Returns:
-      subject_rates: dict size -> price
-      competitors: list of {name, vicinity, website, rates{size->price}}
-      table: dict size -> {subject, competitor_avg, competitor_max, increase_pct, competitor_rates (list)}
+    Scrape subject + competitors for whitelisted sizes and climate buckets.
+    Output:
+      subject_rates: { size: {'climate': x, 'non_climate': y} }
+      competitors: [ {name, vicinity, website, rates{size:{'climate':..,'non_climate':..}} }, ... ]
+      summary: { size: { 'subject_climate': val, 'subject_non_climate': val,
+                         'comp_avg_climate': val, 'comp_max_climate': val,
+                         'comp_avg_non_climate': val, 'comp_max_non_climate': val,
+                         'increase_pct_climate': val, 'increase_pct_non_climate': val } }
     """
-    # Subject website
-    subject_site = subject_place.get('website')
-    if not subject_site:
+    # Subject site
+    subject_site = subject_place.get('website') if subject_place else None
+    if not subject_site and subject_place:
         subj_name = subject_place.get('name', '')
         subject_site = discover_website_for(subj_name, "")
 
     subject_rates = scrape_rates_from_website(subject_site) if subject_site else {}
 
-    # Competitors (within 5 miles)
+    # Competitors
     competitors_data = []
     for comp in market.get('competitors_5', []):
         name = comp.get('name', '')
         vicinity = comp.get('vicinity', '')
         website = get_place_website(comp.get('place_id')) or discover_website_for(name, vicinity)
         rates = scrape_rates_from_website(website) if website else {}
+        # filter to whitelist only (safety)
+        rates = {k: v for k, v in rates.items() if k in SIZE_WHITELIST}
         competitors_data.append({
             'name': name,
             'vicinity': vicinity,
@@ -349,38 +407,47 @@ def build_rate_analysis(subject_place, market):
             'rates': rates
         })
 
-    # Build analysis table across all sizes seen anywhere
-    all_sizes = set(subject_rates.keys())
-    for c in competitors_data:
-        all_sizes.update(c['rates'].keys())
+    # All sizes in whitelist
+    all_sizes = list(SIZE_WHITELIST)
 
-    table = {}
-    for size in sorted(all_sizes, key=lambda s: (int(s.split('x')[0]) if s.split('x')[0].isdigit() else 0,
-                                                int(s.split('x')[1]) if 'x' in s and s.split('x')[1].isdigit() else 0)):
-        subj = subject_rates.get(size)
-        comp_prices = []
+    # Build summary
+    summary = {}
+    for size in all_sizes:
+        subj_cc = subject_rates.get(size, {}).get('climate')
+        subj_nc = subject_rates.get(size, {}).get('non_climate')
+
+        comp_cc_prices = []
+        comp_nc_prices = []
         for c in competitors_data:
-            if size in c['rates']:
-                comp_prices.append(c['rates'][size])
-        if comp_prices:
-            avg_comp = round(sum(comp_prices)/len(comp_prices), 2)
-            max_comp = max(comp_prices)
-        else:
-            avg_comp = 0
-            max_comp = 0
-        if subj and max_comp:
-            inc_pct = round(((max_comp - subj) / subj) * 100, 2) if subj > 0 else 0
-        else:
-            inc_pct = 0
-        table[size] = {
-            'subject': subj if subj is not None else None,
-            'competitor_avg': avg_comp,
-            'competitor_max': max_comp,
-            'increase_pct': inc_pct,
-            'competitor_rates': comp_prices
+            cr = c['rates'].get(size)
+            if cr:
+                if cr.get('climate') is not None:
+                    comp_cc_prices.append(cr['climate'])
+                if cr.get('non_climate') is not None:
+                    comp_nc_prices.append(cr['non_climate'])
+
+        def avg(xs): return round(sum(xs)/len(xs), 2) if xs else 0
+        cc_avg, cc_max = avg(comp_cc_prices), (max(comp_cc_prices) if comp_cc_prices else 0)
+        nc_avg, nc_max = avg(comp_nc_prices), (max(comp_nc_prices) if comp_nc_prices else 0)
+
+        inc_cc = round(((cc_max - subj_cc) / subj_cc) * 100, 2) if subj_cc and cc_max else 0
+        inc_nc = round(((nc_max - subj_nc) / subj_nc) * 100, 2) if subj_nc and nc_max else 0
+
+        summary[size] = {
+            'subject_climate': subj_cc,
+            'subject_non_climate': subj_nc,
+            'comp_avg_climate': cc_avg,
+            'comp_max_climate': cc_max,
+            'comp_avg_non_climate': nc_avg,
+            'comp_max_non_climate': nc_max,
+            'increase_pct_climate': inc_cc,
+            'increase_pct_non_climate': inc_nc
         }
 
-    return subject_rates, competitors_data, table
+    # Ensure subject rates only include whitelist
+    subject_rates = {k: v for k, v in subject_rates.items() if k in SIZE_WHITELIST}
+
+    return subject_rates, competitors_data, summary
 # === END NEW ===
 
 
@@ -404,7 +471,7 @@ def index():
         'cap': 0, 'ppsf': 0, 'score': '',
         'nrsf': 0, 'listings': [], 'recommended_ppsf': 0,
         'recommended_value': 0, 'tax_records': [], 'avg_tax': 0,
-        # === NEW: rate analysis containers in data ===
+        # NEW: rate analysis structures
         'subject_rates': {}, 'competitor_rates': [], 'rate_analysis': {}
     }
     error = None
@@ -475,8 +542,8 @@ def index():
                 taxes     = get_tax_history(addr)
                 avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
-                # === NEW: build rate analysis (subject + competitors) ===
-                subj_rates, comp_rates, table = build_rate_analysis(place or {}, market)
+                # NEW: build rate analysis (subject + competitors) with whitelist + climate
+                subj_rates, comp_rates, summary = build_rate_analysis(place or {}, market)
 
                 data.update({
                     'address': addr,
@@ -502,7 +569,7 @@ def index():
                     # NEW:
                     'subject_rates': subj_rates,
                     'competitor_rates': comp_rates,
-                    'rate_analysis': table
+                    'rate_analysis': summary
                 })
 
     return render_template('index.html', data=data, error=error, google_api_key=GOOGLE_API_KEY)
