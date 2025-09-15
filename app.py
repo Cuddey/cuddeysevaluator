@@ -1,11 +1,10 @@
-# app.py
 import os
 import time
 import math
 import re
 from flask import Flask, render_template, request
 import requests
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from googlesearch import search
@@ -110,7 +109,7 @@ def search_owner_online(owner_name, address):
     query = owner_name or address
     results = []
     try:
-        for url in search(query, num_results=3, pause=2):
+        for url in search(query, num_results=3):   # removed pause
             html = requests.get(url, timeout=5).text
             soup = BeautifulSoup(html, 'html.parser')
             title = soup.title.string if soup.title else url
@@ -181,35 +180,66 @@ def get_market_comps(lat, lng):
     }
 
 
-# 5) Comparables scrapers (REPLACED) – Google-search + regex parsing
-def get_surrounding_listings(lat, lng, addr):
+# 5) Comparables scrapers (Crexi and LoopNet) with timeout handling
+def scrape_crexi(lat, lng, radius_m=1):
     listings = []
-    query = f"self storage for sale near {addr}"
-    for url in search(query, num_results=5, pause=2):
-        parsed = urlparse(url)
-        domain = parsed.netloc.replace('www.', '')
-        if 'crexi.com' not in domain and 'loopnet.com' not in domain:
-            continue
-        try:
-            html = requests.get(url, timeout=5).text
-            name_tag = BeautifulSoup(html, 'html.parser').title
-            title = name_tag.string.strip() if name_tag else domain
-            price_m = re.search(r'\$\s?([\d,]+)', html)
-            size_m  = re.search(r'([\d,]+)\s*(?:sq\.?\s*ft|SF)', html)
-            price = int(price_m.group(1).replace(',', '')) if price_m else 0
-            size  = int(size_m.group(1).replace(',', '')) if size_m else 0
-            ppsf  = round(price/size, 2) if price and size else 0
-            listings.append({
-                'source': domain,
-                'name':   title,
-                'nrsf':   size,
-                'price':  price,
-                'ppsf':   ppsf,
-                'link':   url
-            })
-        except (ReadTimeout, Exception):
-            continue
+    try:
+        url = (
+            f"https://www.crexi.com/search/properties"
+            f"?property_type=Self+Storage&lat={lat}&lng={lng}&radius={radius_m}"
+        )
+        html = requests.get(url, timeout=5).text
+        soup = BeautifulSoup(html, 'html.parser')
+        for card in soup.select(".propertycard"):
+            name = card.select_one(".card-title")
+            price = card.select_one(".card-price")
+            size  = card.select_one(".card-size")
+            link  = card.find("a", href=True)
+            if name and price and size:
+                p = re.sub(r'[^\d.]', '', price.get_text())
+                s = re.sub(r'[^\d.]', '', size.get_text())
+                ppsf = round(float(p) / float(s), 2) if float(s) else 0
+                listings.append({
+                    'source': 'Crexi',
+                    'name':   name.get_text(strip=True),
+                    'nrsf':   float(s),
+                    'price':  float(p),
+                    'ppsf':   ppsf,
+                    'link':   "https://www.crexi.com" + link['href'] if link else ''
+                })
+    except (ReadTimeout, Exception):
+        pass
     return listings
+
+def scrape_loopnet(lat, lng, radius_m=1):
+    listings = []
+    try:
+        url = f"https://www.loopnet.com/for-sale/self-storage/{lat},{lng}/radius-{radius_m}"
+        html = requests.get(url, timeout=5).text
+        soup = BeautifulSoup(html, 'html.parser')
+        for card in soup.select(".placardDetails"):
+            name = card.select_one(".placardTitle a")
+            price = card.select_one(".price")
+            size  = card.select_one(".propertySize")
+            link  = name['href'] if name else ''
+            if name and price and size:
+                p = re.sub(r'[^\d.]', '', price.get_text())
+                s = re.sub(r'[^\d.]', '', size.get_text())
+                ppsf = round(float(p) / float(s), 2) if float(s) else 0
+                listings.append({
+                    'source': 'LoopNet',
+                    'name':   name.get_text(strip=True),
+                    'nrsf':   float(s),
+                    'price':  float(p),
+                    'ppsf':   ppsf,
+                    'link':   "https://www.loopnet.com" + link
+                })
+    except (ReadTimeout, Exception):
+        pass
+    return listings
+
+def get_surrounding_listings(lat, lng):
+    return scrape_crexi(lat, lng) + scrape_loopnet(lat, lng)
 
 
 # 6) Tax history stub
@@ -295,21 +325,28 @@ def index():
                 sv   = (cap >= 7) + (ppsf < 75) + (ask < (noi / 0.07))
                 score = ['Pass', 'Weak', 'Explore', 'Strong'][min(3, sv)]
 
-                # only change below
-                listings    = get_surrounding_listings(lat, lng, addr)
-                avg_ppsf    = round(sum(l['ppsf'] for l in listings) / len(listings), 2) if listings else 0
-                rec_value   = round(avg_ppsf * nrsf, 2) if listings else 0
-
-                taxes       = get_tax_history(addr)
-                avg_tax     = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
+                listings  = get_surrounding_listings(lat, lng)
+                avg_ppsf  = round(sum(l['ppsf'] for l in listings) / len(listings), 2) if listings else 0
+                rec_value = round(avg_ppsf * nrsf, 2) if listings else 0
+                taxes     = get_tax_history(addr)
+                avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
                 data.update({
-                    'address': addr, 'lat': lat, 'lng': lng,
-                    'county': county, 'state': state,
-                    'place': place, 'cad': cad, 'llc': llc,
-                    'owner': owner, 'owner_web': owner_web,
-                    'market': market, 'cap': cap, 'ppsf': ppsf,
-                    'score': score, 'nrsf': nrsf,
+                    'address': addr,
+                    'lat': lat,
+                    'lng': lng,
+                    'county': county,
+                    'state': state,
+                    'place': place,
+                    'cad': cad,
+                    'llc': llc,
+                    'owner': owner,
+                    'owner_web': owner_web,
+                    'market': market,
+                    'cap': cap,
+                    'ppsf': ppsf,
+                    'score': score,
+                    'nrsf': nrsf,
                     'listings': listings,
                     'recommended_ppsf': avg_ppsf,
                     'recommended_value': rec_value,
