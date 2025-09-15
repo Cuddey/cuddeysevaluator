@@ -1,4 +1,3 @@
-<!-- templates/index.html -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -30,7 +29,7 @@
       <h3>🛣️ Street View</h3>
       <iframe
         width="100%" height="250" frameborder="0" style="border:0"
-        src="https://www.google.com/maps/embed/v1/streetview?key={{ google_api_key }}&location={{ data.lat }},{{ data.lng }}&heading=210&pitch=10&fov=80"
+        src="https://www.google.com/maps/embed/v1/streetview?key={{ google_api_key }}&location={{ data.lat }},{{ data.lng }}&fov=80"
         allowfullscreen>
       </iframe>
 
@@ -161,6 +160,77 @@
         <p>No nearby listings found.</p>
       {% endif %}
 
+      <!-- === NEW: Competitor Rates Comparison === -->
+      <h3>📊 Competitor Rates Comparison</h3>
+      {% if data.rate_analysis and data.rate_analysis|length > 0 %}
+        <p><em>Subject website scraped:</em>
+          {% if data.place.website %}
+            <a href="{{ data.place.website }}" target="_blank">{{ data.place.website }}</a>
+          {% else %}
+            (not available)
+          {% endif %}
+        </p>
+
+        <table>
+          <tr>
+            <th>Unit Size</th>
+            <th>Subject Rate</th>
+            <th>Avg Competitor</th>
+            <th>Max Competitor</th>
+            <th>Potential ↑</th>
+            <th>All Competitor Rates</th>
+          </tr>
+          {% for size, r in data.rate_analysis.items() %}
+            <tr>
+              <td>{{ size }}</td>
+              <td>
+                {% if r.subject is not none %}${{ "{:,.0f}".format(r.subject) }}{% else %}N/A{% endif %}
+              </td>
+              <td>${{ "{:,.0f}".format(r.competitor_avg) }}</td>
+              <td>${{ "{:,.0f}".format(r.competitor_max) }}</td>
+              <td>{{ r.increase_pct }}%</td>
+              <td>
+                {% if r.competitor_rates %}
+                  {% for price in r.competitor_rates %}
+                    ${{ "{:,.0f}".format(price) }}{% if not loop.last %}, {% endif %}
+                  {% endfor %}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </table>
+
+        {% if data.competitor_rates and data.competitor_rates|length > 0 %}
+          <details style="margin-top:10px;">
+            <summary>Show per-competitor rate sources</summary>
+            <ul>
+              {% for comp in data.competitor_rates %}
+                <li>
+                  <strong>{{ comp.name }}</strong>
+                  {% if comp.website %}
+                    – <a href="{{ comp.website }}" target="_blank">website</a>
+                  {% endif %}
+                  {% if comp.rates %}
+                    <ul>
+                      {% for k, v in comp.rates.items() %}
+                        <li>{{ k }}: ${{ "{:,.0f}".format(v) }}</li>
+                      {% endfor %}
+                    </ul>
+                  {% else %}
+                    (no rates detected)
+                  {% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+      {% else %}
+        <p>No competitor rates could be detected yet.</p>
+      {% endif %}
+      <!-- === END NEW === -->
+
       <h3>💲 Tax History</h3>
       {% if data.tax_records %}
         <ul>
@@ -207,4 +277,3 @@
   </div>
 </body>
 </html>
-
