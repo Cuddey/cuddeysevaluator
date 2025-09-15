@@ -8,7 +8,7 @@ from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from googlesearch import search
-from requests.exceptions import ReadTimeout
+from requests.exceptions import ReadTimeout, Timeout, RequestException
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
@@ -109,7 +109,7 @@ def search_owner_online(owner_name, address):
     query = owner_name or address
     results = []
     try:
-        for url in search(query, num_results=3):   # (fixed earlier: no pause=)
+        for url in search(query, num_results=3):   # keep small to reduce latency
             html = requests.get(url, timeout=5).text
             soup = BeautifulSoup(html, 'html.parser')
             title = soup.title.string if soup.title else url
@@ -242,18 +242,26 @@ def get_surrounding_listings(lat, lng):
     return scrape_crexi(lat, lng) + scrape_loopnet(lat, lng)
 
 
-# === NEW: rate scraping (restricted sizes + climate detection + stricter matching) ===
+# === NEW: Hardened rate scraping with time budgets, content checks, and HTML fallback ===
 SIZE_WHITELIST = {"5x5", "5x10", "10x10", "10x15", "10x20", "10x30"}
 
-# match 5x5 / 5 x 5 / 10×20 etc.
 _UNIT_RE = re.compile(r'(?<!\d)(\d{1,2})\s*[x×]\s*(\d{1,2})(?!\d)', re.IGNORECASE)
-# prices like $59, 59/mo, $125.00 per month
 _PRICE_RE = re.compile(r'\$?\s?(\d{2,4})(?:\.\d{2})?\s*(?:/|\bper\b)?\s*(?:mo|month|monthly)?', re.IGNORECASE)
-# hints that it's a monthly rental rate (avoid setup fees, deposits)
 _RATE_HINTS = re.compile(r'(rate|rent|monthly|per\s*month|/mo|special)', re.IGNORECASE)
-# climate control keywords
 _CC_POS = re.compile(r'(climate|climatized|temperature|temp[-\s]*controlled|a/c|air\s*conditioned)', re.IGNORECASE)
 _CC_NEG = re.compile(r'(non[-\s]*climate|non[-\s]*climatized|drive[-\s]*up|standard)', re.IGNORECASE)
+
+MAX_COMPETITORS_TO_SCRAPE = 8          # cap to avoid long requests
+PER_REQUEST_TIMEOUT = 4                 # seconds per site
+MAX_BYTES = 400_000                     # 400KB per site to parse
+TOTAL_RATE_SCRAPE_BUDGET = 18           # total seconds budget for all sites in one request
+
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.8"
+}
 
 def _normalize_size(w, l):
     try:
@@ -263,14 +271,39 @@ def _normalize_size(w, l):
     size = f"{w}x{l}"
     return size if size in SIZE_WHITELIST else None
 
+def _safe_fetch_text(url, timeout=PER_REQUEST_TIMEOUT, max_bytes=MAX_BYTES):
+    """
+    Fetch text safely: short timeouts, limit bytes, ensure text/html, return '' on failure.
+    """
+    try:
+        with requests.get(url, headers=_HEADERS, timeout=timeout, stream=True, allow_redirects=True) as r:
+            ct = r.headers.get("Content-Type", "").lower()
+            if "text/html" not in ct and "application/xhtml+xml" not in ct:
+                return ""
+            content = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=4096, decode_unicode=True):
+                if not chunk:
+                    break
+                content.append(chunk)
+                total += len(chunk)
+                if total >= max_bytes:
+                    break
+            return "".join(content)
+    except (Timeout, ReadTimeout, RequestException):
+        return ""
+    except Exception:
+        return ""
+
 def _find_rates_in_text(text):
     """
-    Returns dict:
-      { size: { 'climate': price_or_None, 'non_climate': price_or_None } }
-    Keeps the LOWEST advertised price found for each bucket.
+    Returns dict: { size: { 'climate': price_or_None, 'non_climate': price_or_None } }
+    Keeps the lowest advertised price per bucket.
     """
     out = {}
-    # scan through all size mentions; use a local context window
+    if not text:
+        return out
+
     for m in _UNIT_RE.finditer(text):
         size = _normalize_size(m.group(1), m.group(2))
         if not size:
@@ -279,7 +312,6 @@ def _find_rates_in_text(text):
         end   = min(m.end() + 250, len(text))
         window = text[start:end]
 
-        # we only consider windows that look like rate language
         if not _RATE_HINTS.search(window):
             continue
 
@@ -287,12 +319,10 @@ def _find_rates_in_text(text):
         is_non = _CC_NEG.search(window) is not None
         bucket = 'climate' if is_cc and not is_non else ('non_climate' if is_non and not is_cc else None)
 
-        # collect prices in the window
         candidates = []
         for p in _PRICE_RE.findall(window):
             try:
                 val = float(p)
-                # plausible monthly self storage band
                 if 15 <= val <= 1000:
                     candidates.append(val)
             except:
@@ -309,15 +339,13 @@ def _find_rates_in_text(text):
             if out[size]['non_climate'] is None or price < out[size]['non_climate']:
                 out[size]['non_climate'] = price
         else:
-            # if indeterminate, prefer to fill whichever is empty
+            # indeterminate: fill whichever is empty first, else keep overall minimum signal
             if out[size]['non_climate'] is None:
                 out[size]['non_climate'] = price
             elif out[size]['climate'] is None:
                 out[size]['climate'] = price
             else:
-                # keep the lowest of the two if this is smaller
                 if price < min(out[size]['climate'], out[size]['non_climate']):
-                    # replace the higher one to keep min signal
                     if out[size]['climate'] >= out[size]['non_climate']:
                         out[size]['climate'] = price
                     else:
@@ -326,23 +354,37 @@ def _find_rates_in_text(text):
 
 def scrape_rates_from_website(url):
     """
-    Fetch site and extract unit sizes + rates using regex (whitelist sizes only).
-    Return dict size -> {'climate': price_or_None, 'non_climate': price_or_None}
+    Fetch site and extract unit sizes + rates (whitelist sizes only).
+    Robust against malformed HTML or non-text responses.
     """
-    try:
-        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        visible = soup.get_text(separator=' ', strip=True)
-        # cap text length to keep it fast and avoid false positives deep in scripts
-        combined = (visible[:250000]).lower()
-        return _find_rates_in_text(combined)
-    except Exception:
+    if not url:
+        return {}
+    # 1) Safe fetch a limited amount of bytes
+    txt = _safe_fetch_text(url)
+    if not txt:
         return {}
 
-def discover_website_for(name, vicinity, fallback_query_suffix="storage units prices"):
-    query = f"{name} {vicinity} {fallback_query_suffix}"
+    # 2) Prefer text-only extraction; try Soup but handle parser failures
     try:
-        for url in search(query, num_results=3):
+        soup = BeautifulSoup(txt, 'html.parser')
+        visible = soup.get_text(separator=' ', strip=True)
+        combined = (visible[:300_000]).lower()
+    except Exception:
+        # Fallback: strip tags naively
+        combined = re.sub(r'<[^>]+>', ' ', txt)
+        combined = combined[:300_000].lower()
+
+    # 3) Find rates from combined text
+    raw = _find_rates_in_text(combined)
+    # Ensure whitelist only (safety)
+    raw = {k: v for k, v in raw.items() if k in SIZE_WHITELIST}
+    return raw
+
+def discover_website_for(name, vicinity, fallback_query_suffix="storage units prices"):
+    query = f"{name} {vicinity} {fallback_query_suffix}".strip()
+    try:
+        # Keep this tiny; each search can be slow
+        for url in search(query, num_results=2):
             u = url.lower()
             if any(t in u for t in [".com", ".net", ".org", ".storage"]) and not any(
                 b in u for b in ["facebook.com", "yelp.com", "google.com/maps", "bing.com"]
@@ -357,49 +399,53 @@ def get_place_website(place_id):
         res = requests.get(
             "https://maps.googleapis.com/maps/api/place/details/json",
             params={'place_id': place_id, 'fields': 'website', 'key': GOOGLE_API_KEY},
-            timeout=6
+            timeout=PER_REQUEST_TIMEOUT
         ).json()
         return res.get('result', {}).get('website')
     except Exception:
         return None
 
-def select_price_for_bucket(d, want_cc):
-    """Pick climate/non-climate depending on desired bucket; fall back gracefully."""
-    if not d:
-        return None
-    if want_cc:
-        return d.get('climate') or d.get('non_climate')
-    else:
-        return d.get('non_climate') or d.get('climate')
-
 def build_rate_analysis(subject_place, market):
     """
-    Scrape subject + competitors for whitelisted sizes and climate buckets.
-    Output:
-      subject_rates: { size: {'climate': x, 'non_climate': y} }
-      competitors: [ {name, vicinity, website, rates{size:{'climate':..,'non_climate':..}} }, ... ]
-      summary: { size: { 'subject_climate': val, 'subject_non_climate': val,
-                         'comp_avg_climate': val, 'comp_max_climate': val,
-                         'comp_avg_non_climate': val, 'comp_max_non_climate': val,
-                         'increase_pct_climate': val, 'increase_pct_non_climate': val } }
+    Scrape subject + up to N competitors with a total time budget.
+    Return:
+      subject_rates, competitors_data, summary_table
     """
+    start_time = time.time()
+
     # Subject site
     subject_site = subject_place.get('website') if subject_place else None
     if not subject_site and subject_place:
         subj_name = subject_place.get('name', '')
-        subject_site = discover_website_for(subj_name, "")
+        # quick discover (1–2 candidates only)
+        if time.time() - start_time < TOTAL_RATE_SCRAPE_BUDGET:
+            subject_site = discover_website_for(subj_name, "")
 
-    subject_rates = scrape_rates_from_website(subject_site) if subject_site else {}
+    subject_rates = {}
+    if subject_site and (time.time() - start_time < TOTAL_RATE_SCRAPE_BUDGET):
+        subject_rates = scrape_rates_from_website(subject_site)
 
-    # Competitors
+    # Competitors (cap + time budget)
+    competitors = market.get('competitors_5', [])[:MAX_COMPETITORS_TO_SCRAPE]
     competitors_data = []
-    for comp in market.get('competitors_5', []):
+    for comp in competitors:
+        if time.time() - start_time >= TOTAL_RATE_SCRAPE_BUDGET:
+            break
+
         name = comp.get('name', '')
         vicinity = comp.get('vicinity', '')
-        website = get_place_website(comp.get('place_id')) or discover_website_for(name, vicinity)
-        rates = scrape_rates_from_website(website) if website else {}
-        # filter to whitelist only (safety)
+        website = get_place_website(comp.get('place_id'))
+
+        if not website and (time.time() - start_time < TOTAL_RATE_SCRAPE_BUDGET):
+            website = discover_website_for(name, vicinity)
+
+        rates = {}
+        if website and (time.time() - start_time < TOTAL_RATE_SCRAPE_BUDGET):
+            rates = scrape_rates_from_website(website)
+
+        # filter whitelist (safety)
         rates = {k: v for k, v in rates.items() if k in SIZE_WHITELIST}
+
         competitors_data.append({
             'name': name,
             'vicinity': vicinity,
@@ -407,12 +453,10 @@ def build_rate_analysis(subject_place, market):
             'rates': rates
         })
 
-    # All sizes in whitelist
-    all_sizes = list(SIZE_WHITELIST)
-
-    # Build summary
+    # Build summary table for all whitelisted sizes
+    def avg(xs): return round(sum(xs)/len(xs), 2) if xs else 0
     summary = {}
-    for size in all_sizes:
+    for size in sorted(list(SIZE_WHITELIST)):
         subj_cc = subject_rates.get(size, {}).get('climate')
         subj_nc = subject_rates.get(size, {}).get('non_climate')
 
@@ -426,7 +470,6 @@ def build_rate_analysis(subject_place, market):
                 if cr.get('non_climate') is not None:
                     comp_nc_prices.append(cr['non_climate'])
 
-        def avg(xs): return round(sum(xs)/len(xs), 2) if xs else 0
         cc_avg, cc_max = avg(comp_cc_prices), (max(comp_cc_prices) if comp_cc_prices else 0)
         nc_avg, nc_max = avg(comp_nc_prices), (max(comp_nc_prices) if comp_nc_prices else 0)
 
@@ -444,9 +487,8 @@ def build_rate_analysis(subject_place, market):
             'increase_pct_non_climate': inc_nc
         }
 
-    # Ensure subject rates only include whitelist
+    # ensure subject rates only include whitelist
     subject_rates = {k: v for k, v in subject_rates.items() if k in SIZE_WHITELIST}
-
     return subject_rates, competitors_data, summary
 # === END NEW ===
 
@@ -542,7 +584,7 @@ def index():
                 taxes     = get_tax_history(addr)
                 avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
-                # NEW: build rate analysis (subject + competitors) with whitelist + climate
+                # NEW: build rate analysis (subject + competitors) within budget
                 subj_rates, comp_rates, summary = build_rate_analysis(place or {}, market)
 
                 data.update({
