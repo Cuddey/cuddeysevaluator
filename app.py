@@ -2,22 +2,49 @@ import os
 import time
 import math
 import re
+import json
+from urllib.parse import quote_plus, urljoin, urlparse
+
 from flask import Flask, render_template, request
 import requests
-from urllib.parse import quote_plus, urljoin, urlparse
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from googlesearch import search
 from requests.exceptions import ReadTimeout, Timeout, RequestException
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
 
 app = Flask(__name__)
 
-# 1) CAD Scrapers for Texas appraisal districts
+# --------------------------
+# Small in-process TTL cache
+# --------------------------
+_CACHE = {}
+CACHE_TTL_SEC = 6 * 60 * 60     # 6 hours
+CACHE_MAX_KEYS = 1000
+
+def cache_get(key):
+    v = _CACHE.get(key)
+    if not v: return None
+    val, ts = v
+    if time.time() - ts > CACHE_TTL_SEC:
+        _CACHE.pop(key, None)
+        return None
+    return val
+
+def cache_set(key, val):
+    if len(_CACHE) > CACHE_MAX_KEYS:
+        # drop ~10% oldest
+        for k, _ in list(sorted(_CACHE.items(), key=lambda kv: kv[1][1]))[: max(1, CACHE_MAX_KEYS // 10)]:
+            _CACHE.pop(k, None)
+    _CACHE[key] = (val, time.time())
+
+
+# =============================================================================
+# 1) CAD Scrapers (unchanged)
+# =============================================================================
 def tarrant_cad(address):
     url = f"https://www.tad.org/property-search-results/?searchtext={quote_plus(address)}"
     html = requests.get(url, timeout=10).text
@@ -73,7 +100,9 @@ def get_cad_details(county, state, address):
     return {'link': f"https://www.google.com/search?q={query}"}
 
 
-# 2) LLC Tracing via OpenCorporates
+# =============================================================================
+# 2) LLC & Owner (unchanged)
+# =============================================================================
 def get_llc_info(owner_name):
     if not owner_name:
         return {}
@@ -96,22 +125,14 @@ def get_llc_info(owner_name):
     except:
         return {}
 
-
-# 3) Owner Profile stub and online search
 def get_owner_profile(llc_name):
-    return {
-        'linkedIn': 'N/A',
-        'facebook': 'N/A',
-        'emails': [],
-        'phones': [],
-        'other_businesses': []
-    }
+    return {'linkedIn':'N/A','facebook':'N/A','emails':[],'phones':[],'other_businesses':[]}
 
 def search_owner_online(owner_name, address):
     query = owner_name or address
     results = []
     try:
-        for url in search(query, num_results=3):   # keep small to reduce latency
+        for url in search(query, num_results=3):
             html = requests.get(url, timeout=5).text
             soup = BeautifulSoup(html, 'html.parser')
             title = soup.title.string if soup.title else url
@@ -131,7 +152,9 @@ def search_owner_online(owner_name, address):
     return results
 
 
-# 4) Market and competition via Google Places
+# =============================================================================
+# 4) Market & competition (unchanged)
+# =============================================================================
 def nearby_storage(lat, lng, radius_m):
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     params = {
@@ -182,7 +205,9 @@ def get_market_comps(lat, lng):
     }
 
 
-# 5) Comparables scrapers (Crexi and LoopNet) with timeout handling
+# =============================================================================
+# 5) Listing comps (unchanged)
+# =============================================================================
 def scrape_crexi(lat, lng, radius_m=1):
     listings = []
     try:
@@ -244,19 +269,25 @@ def get_surrounding_listings(lat, lng):
     return scrape_crexi(lat, lng) + scrape_loopnet(lat, lng)
 
 
-# === NEW: Stronger rate scraping (multi-strategy + concurrency + time budgets) ===
+# =============================================================================
+# === NEW: Stronger, faster, more reliable rate scraping ===
+# =============================================================================
+
+# Only these sizes
 SIZE_WHITELIST = {"5x5", "5x10", "10x10", "10x15", "10x20", "10x30"}
 
+# Heuristics & regex
 _UNIT_RE = re.compile(r'(?<!\d)(\d{1,2})\s*[x×]\s*(\d{1,2})(?!\d)', re.IGNORECASE)
 _PRICE_RE = re.compile(r'\$?\s?(\d{2,4})(?:\.\d{2})?\s*(?:/|\bper\b)?\s*(?:mo|month|monthly)?', re.IGNORECASE)
 _RATE_HINTS = re.compile(r'(rate|rent|monthly|per\s*month|/mo|special|price)', re.IGNORECASE)
 _CC_POS = re.compile(r'(climate|climatized|temperature|temp[-\s]*controlled|a/c|air\s*conditioned)', re.IGNORECASE)
 _CC_NEG = re.compile(r'(non[-\s]*climate|non[-\s]*climatized|drive[-\s]*up|standard)', re.IGNORECASE)
 
-MAX_COMPETITORS_TO_SCRAPE = 8
+# Speed/limits
+MAX_COMPETITORS_TO_SCRAPE = 6
 PER_REQUEST_TIMEOUT = 5
 MAX_BYTES = 600_000
-TOTAL_RATE_SCRAPE_BUDGET = 18
+TOTAL_RATE_SCRAPE_BUDGET = 12
 DISCOVERY_PATHS = ["/units", "/rent", "/storage-units", "/self-storage", "/pricing", "/rates", "/rent-online"]
 
 _HEADERS = {
@@ -275,10 +306,15 @@ def _normalize_size(w, l):
     return size if size in SIZE_WHITELIST else None
 
 def _safe_fetch_text(url, timeout=PER_REQUEST_TIMEOUT, max_bytes=MAX_BYTES):
+    ck = f"fetch:{url}"
+    cached = cache_get(ck)
+    if cached is not None:
+        return cached
     try:
         with requests.get(url, headers=_HEADERS, timeout=timeout, stream=True, allow_redirects=True) as r:
             ct = r.headers.get("Content-Type", "").lower()
             if "text/html" not in ct and "application/xhtml+xml" not in ct:
+                cache_set(ck, "")
                 return ""
             content = []
             total = 0
@@ -289,220 +325,22 @@ def _safe_fetch_text(url, timeout=PER_REQUEST_TIMEOUT, max_bytes=MAX_BYTES):
                 total += len(chunk)
                 if total >= max_bytes:
                     break
-            return "".join(content)
+            text = "".join(content)
+            cache_set(ck, text)
+            return text
     except (Timeout, ReadTimeout, RequestException):
+        cache_set(ck, "")
         return ""
     except Exception:
+        cache_set(ck, "")
         return ""
-
-def _parse_json_ld(soup):
-    rates = {}
-    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(s.string or s.text or "")
-        except Exception:
-            continue
-        objs = data if isinstance(data, list) else [data]
-        for obj in objs:
-            # Product with offers
-            if isinstance(obj, dict) and obj.get("@type", "").lower() in ("product", "offer", "service"):
-                name = (obj.get("name") or obj.get("sku") or "").lower()
-                size = None
-                for m in _UNIT_RE.finditer(name):
-                    size = _normalize_size(m.group(1), m.group(2))
-                    if size: break
-                offer = obj.get("offers") or {}
-                if isinstance(offer, list): offer = offer[0] if offer else {}
-                price = offer.get("price") or obj.get("price")
-                cc_bucket = None
-                txt = json.dumps(obj).lower()
-                if _CC_POS.search(txt) and not _CC_NEG.search(txt): cc_bucket = "climate"
-                elif _CC_NEG.search(txt) and not _CC_POS.search(txt): cc_bucket = "non_climate"
-
-                try:
-                    if size and price:
-                        price = float(re.sub(r"[^\d.]", "", str(price)))
-                        rates.setdefault(size, {"climate": None, "non_climate": None})
-                        if cc_bucket == "climate":
-                            rates[size]["climate"] = min(price, rates[size]["climate"]) if rates[size]["climate"] else price
-                        elif cc_bucket == "non_climate":
-                            rates[size]["non_climate"] = min(price, rates[size]["non_climate"]) if rates[size]["non_climate"] else price
-                        else:
-                            # fill whichever empty
-                            if rates[size]["non_climate"] is None:
-                                rates[size]["non_climate"] = price
-                            elif rates[size]["climate"] is None:
-                                rates[size]["climate"] = price
-                except:
-                    pass
-    return rates
-
-def _parse_tables(soup):
-    rates = {}
-    for table in soup.find_all("table"):
-        headers = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
-        if not headers:  # some sites use first row as headers
-            first = table.find("tr")
-            if first:
-                headers = [td.get_text(" ", strip=True).lower() for td in first.find_all(["td","th"])]
-        if not headers:
-            continue
-        if not any("size" in h for h in headers):
-            continue
-        if not any(("price" in h) or ("rate" in h) for h in headers):
-            continue
-
-        rows = table.find_all("tr")
-        # skip header row if it is clearly header
-        start_idx = 1 if rows and any(h in rows[0].get_text(" ", strip=True).lower() for h in ("size","price","rate")) else 0
-        for tr in rows[start_idx:]:
-            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
-            if not cells or len(cells) < 2:
-                continue
-            row_text = " ".join(cells)
-            m = _UNIT_RE.search(row_text)
-            if not m: 
-                continue
-            size = _normalize_size(m.group(1), m.group(2))
-            if not size:
-                continue
-            price = None
-            cc_bucket = None
-            joined = " ".join(cells).lower()
-            if _CC_POS.search(joined) and not _CC_NEG.search(joined): cc_bucket = "climate"
-            elif _CC_NEG.search(joined) and not _CC_POS.search(joined): cc_bucket = "non_climate"
-
-            prices = _PRICE_RE.findall(joined)
-            vals = []
-            for p in prices:
-                try:
-                    v = float(p)
-                    if 15 <= v <= 1000:
-                        vals.append(v)
-                except:
-                    pass
-            if vals:
-                price = min(vals)
-
-            if price is not None:
-                rates.setdefault(size, {"climate": None, "non_climate": None})
-                if cc_bucket == "climate":
-                    rates[size]["climate"] = min(price, rates[size]["climate"]) if rates[size]["climate"] else price
-                elif cc_bucket == "non_climate":
-                    rates[size]["non_climate"] = min(price, rates[size]["non_climate"]) if rates[size]["non_climate"] else price
-                else:
-                    if rates[size]["non_climate"] is None:
-                        rates[size]["non_climate"] = price
-                    elif rates[size]["climate"] is None:
-                        rates[size]["climate"] = price
-                    else:
-                        if price < min(rates[size]["climate"], rates[size]["non_climate"]):
-                            if rates[size]["climate"] >= rates[size]["non_climate"]:
-                                rates[size]["climate"] = price
-                            else:
-                                rates[size]["non_climate"] = price
-    return rates
-
-def _parse_cards(soup):
-    rates = {}
-    # common unit cards
-    candidates = soup.select(
-        "[class*='unit'], [class*='sr-unit'], [class*='stor'], [data-unit], [data-size]"
-    )
-    for c in candidates:
-        txt = c.get_text(" ", strip=True).lower()
-        m = _UNIT_RE.search(txt)
-        if not m:
-            continue
-        size = _normalize_size(m.group(1), m.group(2))
-        if not size:
-            continue
-
-        cc_bucket = None
-        if _CC_POS.search(txt) and not _CC_NEG.search(txt): cc_bucket = "climate"
-        elif _CC_NEG.search(txt) and not _CC_POS.search(txt): cc_bucket = "non_climate"
-
-        prices = _PRICE_RE.findall(txt)
-        vals = []
-        for p in prices:
-            try:
-                v = float(p)
-                if 15 <= v <= 1000:
-                    vals.append(v)
-            except:
-                pass
-        if not vals:
-            continue
-        price = min(vals)
-
-        rates.setdefault(size, {"climate": None, "non_climate": None})
-        if cc_bucket == "climate":
-            rates[size]["climate"] = min(price, rates[size]["climate"]) if rates[size]["climate"] else price
-        elif cc_bucket == "non_climate":
-            rates[size]["non_climate"] = min(price, rates[size]["non_climate"]) if rates[size]["non_climate"] else price
-        else:
-            if rates[size]["non_climate"] is None:
-                rates[size]["non_climate"] = price
-            elif rates[size]["climate"] is None:
-                rates[size]["climate"] = price
-            else:
-                if price < min(rates[size]["climate"], rates[size]["non_climate"]):
-                    if rates[size]["climate"] >= rates[size]["non_climate"]:
-                        rates[size]["climate"] = price
-                    else:
-                        rates[size]["non_climate"] = price
-    return rates
-
-def _regex_fallback(text):
-    out = {}
-    if not text:
-        return out
-    text = text.lower()
-    for m in _UNIT_RE.finditer(text):
-        size = _normalize_size(m.group(1), m.group(2))
-        if not size:
-            continue
-        start = max(m.start() - 150, 0)
-        end   = min(m.end() + 250, len(text))
-        window = text[start:end]
-        if not _RATE_HINTS.search(window):
-            continue
-        is_cc = _CC_POS.search(window) is not None
-        is_non = _CC_NEG.search(window) is not None
-        bucket = 'climate' if is_cc and not is_non else ('non_climate' if is_non and not is_cc else None)
-        vals = []
-        for p in _PRICE_RE.findall(window):
-            try:
-                v = float(p)
-                if 15 <= v <= 1000:
-                    vals.append(v)
-            except:
-                pass
-        if not vals:
-            continue
-        price = min(vals)
-        out.setdefault(size, {'climate': None, 'non_climate': None})
-        if bucket == 'climate':
-            out[size]['climate'] = min(price, out[size]['climate']) if out[size]['climate'] else price
-        elif bucket == 'non_climate':
-            out[size]['non_climate'] = min(price, out[size]['non_climate']) if out[size]['non_climate'] else price
-        else:
-            if out[size]['non_climate'] is None:
-                out[size]['non_climate'] = price
-            elif out[size]['climate'] is None:
-                out[size]['climate'] = price
-            else:
-                if price < min(out[size]['climate'], out[size]['non_climate']):
-                    if out[size]['climate'] >= out[size]['non_climate']:
-                        out[size]['climate'] = price
-                    else:
-                        out[size]['non_climate'] = price
-    return out
 
 def _merge_rate_dicts(dicts):
     merged = {}
     for d in dicts:
         for k, v in d.items():
+            if k not in SIZE_WHITELIST:  # enforce whitelist
+                continue
             merged.setdefault(k, {"climate": None, "non_climate": None})
             for bucket in ("climate", "non_climate"):
                 val = v.get(bucket)
@@ -512,281 +350,508 @@ def _merge_rate_dicts(dicts):
                     merged[k][bucket] = val
     return merged
 
+# ---------- General parsers (improved) ----------
+def _parse_json_ld(soup):
+    rates = {}
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = s.string or s.text or ""
+        if not raw.strip():
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        objs = data if isinstance(data, list) else [data]
+        for obj in objs:
+            if not isinstance(obj, dict): 
+                continue
+            name = (obj.get("name") or obj.get("sku") or obj.get("description") or "").lower()
+            size = None
+            for m in _UNIT_RE.finditer(name):
+                size = _normalize_size(m.group(1), m.group(2))
+                if size: break
+            offer = obj.get("offers")
+            if isinstance(offer, list): 
+                offer = offer[0] if offer else {}
+            price = None
+            if isinstance(offer, dict):
+                price = offer.get("price") or offer.get("lowPrice")
+            if not price:
+                price = obj.get("price")
+            if size and price:
+                try:
+                    price_v = float(re.sub(r"[^\d.]", "", str(price)))
+                except:
+                    continue
+                cc_bucket = None
+                txt = json.dumps(obj).lower()
+                if _CC_POS.search(txt) and not _CC_NEG.search(txt): cc_bucket = "climate"
+                elif _CC_NEG.search(txt) and not _CC_POS.search(txt): cc_bucket = "non_climate"
+                rates.setdefault(size, {"climate": None, "non_climate": None})
+                if cc_bucket == "climate":
+                    rates[size]["climate"] = price_v if rates[size]["climate"] is None else min(rates[size]["climate"], price_v)
+                elif cc_bucket == "non_climate":
+                    rates[size]["non_climate"] = price_v if rates[size]["non_climate"] is None else min(rates[size]["non_climate"], price_v)
+                else:
+                    # fill whichever empty first
+                    if rates[size]["non_climate"] is None: rates[size]["non_climate"] = price_v
+                    elif rates[size]["climate"] is None:   rates[size]["climate"]   = price_v
+    return rates
+
+def _parse_tables(soup):
+    rates = {}
+    for table in soup.find_all("table"):
+        headers = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
+        if not headers:
+            first = table.find("tr")
+            if first:
+                headers = [td.get_text(" ", strip=True).lower() for td in first.find_all(["td","th"])]
+        if not headers or not any("size" in h for h in headers) or not any(("price" in h) or ("rate" in h) for h in headers):
+            continue
+        rows = table.find_all("tr")
+        for tr in rows[1:]:
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
+            if not cells: continue
+            row_txt = " ".join(cells).lower()
+            m = _UNIT_RE.search(row_txt)
+            if not m: continue
+            size = _normalize_size(m.group(1), m.group(2))
+            if not size: continue
+            cc_bucket = "climate" if (_CC_POS.search(row_txt) and not _CC_NEG.search(row_txt)) else ("non_climate" if (_CC_NEG.search(row_txt) and not _CC_POS.search(row_txt)) else None)
+            vals=[]
+            for p in _PRICE_RE.findall(row_txt):
+                try:
+                    v=float(p); 
+                    if 15<=v<=1000: vals.append(v)
+                except: pass
+            if not vals: continue
+            price=min(vals)
+            rates.setdefault(size, {"climate": None, "non_climate": None})
+            if cc_bucket == "climate":
+                rates[size]["climate"]= price if rates[size]["climate"] is None else min(rates[size]["climate"], price)
+            elif cc_bucket == "non_climate":
+                rates[size]["non_climate"]= price if rates[size]["non_climate"] is None else min(rates[size]["non_climate"], price)
+            else:
+                if rates[size]["non_climate"] is None: rates[size]["non_climate"]=price
+                elif rates[size]["climate"] is None:   rates[size]["climate"]=price
+    return rates
+
+def _parse_cards(soup):
+    rates={}
+    nodes = soup.select("[class*='unit'], [class*='sr-unit'], [class*='stor'], [data-unit], [data-size]")
+    for c in nodes:
+        txt = c.get_text(" ", strip=True).lower()
+        m=_UNIT_RE.search(txt)
+        if not m: continue
+        size=_normalize_size(m.group(1), m.group(2))
+        if not size: continue
+        cc_bucket = "climate" if (_CC_POS.search(txt) and not _CC_NEG.search(txt)) else ("non_climate" if (_CC_NEG.search(txt) and not _CC_POS.search(txt)) else None)
+        vals=[]
+        for p in _PRICE_RE.findall(txt):
+            try:
+                v=float(p); 
+                if 15<=v<=1000: vals.append(v)
+            except: pass
+        if not vals: continue
+        price=min(vals)
+        rates.setdefault(size, {"climate": None, "non_climate": None})
+        if cc_bucket=="climate":
+            rates[size]["climate"]= price if rates[size]["climate"] is None else min(rates[size]["climate"], price)
+        elif cc_bucket=="non_climate":
+            rates[size]["non_climate"]= price if rates[size]["non_climate"] is None else min(rates[size]["non_climate"], price)
+        else:
+            if rates[size]["non_climate"] is None: rates[size]["non_climate"]=price
+            elif rates[size]["climate"] is None:   rates[size]["climate"]=price
+    return rates
+
+def _regex_fallback(text):
+    out={}
+    if not text: return out
+    text=text.lower()
+    for m in _UNIT_RE.finditer(text):
+        size=_normalize_size(m.group(1), m.group(2))
+        if not size: continue
+        start=max(m.start()-150,0); end=min(m.end()+250,len(text))
+        win=text[start:end]
+        if not _RATE_HINTS.search(win): continue
+        bucket = "climate" if (_CC_POS.search(win) and not _CC_NEG.search(win)) else ("non_climate" if (_CC_NEG.search(win) and not _CC_POS.search(win)) else None)
+        vals=[]
+        for p in _PRICE_RE.findall(win):
+            try:
+                v=float(p); 
+                if 15<=v<=1000: vals.append(v)
+            except: pass
+        if not vals: continue
+        price=min(vals)
+        out.setdefault(size, {"climate": None, "non_climate": None})
+        if bucket=="climate":
+            out[size]["climate"]= price if out[size]["climate"] is None else min(out[size]["climate"], price)
+        elif bucket=="non_climate":
+            out[size]["non_climate"]= price if out[size]["non_climate"] is None else min(out[size]["non_climate"], price)
+        else:
+            if out[size]["non_climate"] is None: out[size]["non_climate"]=price
+            elif out[size]["climate"] is None:   out[size]["climate"]=price
+    return out
+
+# ---------- Chain-specific adapters (accuracy boost) ----------
+def _domain(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except:
+        return ""
+
+def _scrape_publicstorage(html):
+    """PublicStorage uses Next.js __NEXT_DATA__ with unit details."""
+    soup=BeautifulSoup(html, 'html.parser')
+    data_tag = soup.find("script", id="__NEXT_DATA__")
+    rates={}
+    if not data_tag or not data_tag.string: 
+        return rates
+    try:
+        data=json.loads(data_tag.string)
+    except:
+        return rates
+    txt=json.dumps(data).lower()
+    # Generic walk
+    def walk(o):
+        local={}
+        if isinstance(o, dict):
+            s=json.dumps(o).lower()
+            for m in _UNIT_RE.finditer(s):
+                size=_normalize_size(m.group(1), m.group(2))
+                if not size: continue
+                vals=[]
+                for p in _PRICE_RE.findall(s):
+                    try:
+                        v=float(p); 
+                        if 15<=v<=1000: vals.append(v)
+                    except: pass
+                if not vals: 
+                    continue
+                cc_bucket = "climate" if (_CC_POS.search(s) and not _CC_NEG.search(s)) else ("non_climate" if (_CC_NEG.search(s) and not _CC_POS.search(s)) else None)
+                price=min(vals)
+                local.setdefault(size, {"climate": None, "non_climate": None})
+                if cc_bucket=="climate":
+                    local[size]["climate"]=price
+                elif cc_bucket=="non_climate":
+                    local[size]["non_climate"]=price
+                else:
+                    if local[size]["non_climate"] is None: local[size]["non_climate"]=price
+                    elif local[size]["climate"] is None:   local[size]["climate"]=price
+            for v in o.values():
+                sub=walk(v)
+                local=_merge_rate_dicts([local, sub])
+        elif isinstance(o, list):
+            local={}
+            for it in o:
+                sub=walk(it)
+                local=_merge_rate_dicts([local, sub])
+        else:
+            return {}
+        return local
+    return walk(data)
+
+def _scrape_extraspace(html):
+    """ExtraSpace often exposes JSON-LD + redux-like state."""
+    soup=BeautifulSoup(html,'html.parser')
+    rates=_parse_json_ld(soup)
+    # look for window.__PRELOADED_STATE__ or INITIAL_STATE
+    for s in soup.find_all("script"):
+        raw=(s.string or s.text or "")
+        if any(k in raw for k in ("__PRELOADED_STATE__", "INITIAL_STATE", "__INITIAL_STATE__")):
+            try:
+                json_txt=re.sub(r"^[^{\[]+","",raw)
+                json_txt=re.sub(r";\s*$","",json_txt)
+                data=json.loads(json_txt)
+                # walk
+                def walk(o):
+                    local={}
+                    if isinstance(o, dict):
+                        st=json.dumps(o).lower()
+                        for m in _UNIT_RE.finditer(st):
+                            size=_normalize_size(m.group(1), m.group(2))
+                            if not size: continue
+                            vals=[]
+                            for p in _PRICE_RE.findall(st):
+                                try:
+                                    v=float(p); 
+                                    if 15<=v<=1000: vals.append(v)
+                                except: pass
+                            if not vals: continue
+                            bucket="climate" if (_CC_POS.search(st) and not _CC_NEG.search(st)) else ("non_climate" if (_CC_NEG.search(st) and not _CC_POS.search(st)) else None)
+                            price=min(vals)
+                            local.setdefault(size, {"climate": None, "non_climate": None})
+                            if bucket=="climate": local[size]["climate"]=price
+                            elif bucket=="non_climate": local[size]["non_climate"]=price
+                            else:
+                                if local[size]["non_climate"] is None: local[size]["non_climate"]=price
+                                elif local[size]["climate"] is None:   local[size]["climate"]=price
+                        for v in o.values():
+                            sub=walk(v)
+                            local=_merge_rate_dicts([local, sub])
+                    elif isinstance(o, list):
+                        local={}
+                        for it in o:
+                            sub=walk(it)
+                            local=_merge_rate_dicts([local, sub])
+                    else:
+                        return {}
+                    return local
+                rates=_merge_rate_dicts([rates, walk(data)])
+            except: 
+                pass
+    if not rates:
+        rates=_parse_tables(soup)
+        rates=_merge_rate_dicts([rates, _parse_cards(soup)])
+    return rates
+
+def _scrape_cubesmart(html):
+    """CubeSmart exposes 'initState' JSON in scripts; also table markup."""
+    soup=BeautifulSoup(html,'html.parser')
+    rates=_parse_tables(soup)
+    rates=_merge_rate_dicts([rates, _parse_cards(soup), _parse_json_ld(soup)])
+    if rates: return rates
+    for s in soup.find_all("script"):
+        raw=(s.string or s.text or "")
+        if "initState" in raw or "initialState" in raw:
+            try:
+                json_txt=re.sub(r"^[^{\[]+","",raw)
+                json_txt=re.sub(r";\s*$","",json_txt)
+                data=json.loads(json_txt)
+                # walk
+                def walk(o):
+                    local={}
+                    if isinstance(o, dict):
+                        st=json.dumps(o).lower()
+                        for m in _UNIT_RE.finditer(st):
+                            size=_normalize_size(m.group(1), m.group(2))
+                            if not size: continue
+                            vals=[]
+                            for p in _PRICE_RE.findall(st):
+                                try:
+                                    v=float(p); 
+                                    if 15<=v<=1000: vals.append(v)
+                                except: pass
+                            if not vals: continue
+                            bucket="climate" if (_CC_POS.search(st) and not _CC_NEG.search(st)) else ("non_climate" if (_CC_NEG.search(st) and not _CC_POS.search(st)) else None)
+                            price=min(vals)
+                            local.setdefault(size, {"climate": None, "non_climate": None})
+                            if bucket=="climate": local[size]["climate"]=price
+                            elif bucket=="non_climate": local[size]["non_climate"]=price
+                            else:
+                                if local[size]["non_climate"] is None: local[size]["non_climate"]=price
+                                elif local[size]["climate"] is None:   local[size]["climate"]=price
+                        for v in o.values():
+                            sub=walk(v)
+                            local=_merge_rate_dicts([local, sub])
+                    elif isinstance(o, list):
+                        local={}
+                        for it in o:
+                            sub=walk(it)
+                            local=_merge_rate_dicts([local, sub])
+                    else:
+                        return {}
+                    return local
+                return walk(data)
+            except:
+                pass
+    return rates
+
+def _scrape_lifestorage(html):
+    """Life Storage: JSON-LD + tables/cards typical."""
+    soup=BeautifulSoup(html,'html.parser')
+    rates=_parse_json_ld(soup)
+    rates=_merge_rate_dicts([rates, _parse_tables(soup), _parse_cards(soup)])
+    if not rates:
+        text=soup.get_text(" ", strip=True).lower()
+        rates=_merge_rate_dicts([rates, _regex_fallback(text)])
+    return rates
+
+def _scrape_uhaul(html):
+    """U-Haul storage pages often render tables with unit sizes and monthly prices."""
+    soup=BeautifulSoup(html,'html.parser')
+    rates=_parse_tables(soup)
+    if not rates:
+        rates=_parse_cards(soup)
+    if not rates:
+        text=soup.get_text(" ", strip=True).lower()
+        rates=_regex_fallback(text)
+    return rates
+
+def _domain_specific_rates(url, html):
+    d=_domain(url)
+    if "publicstorage.com" in d:
+        return _scrape_publicstorage(html)
+    if "extraspace.com" in d:
+        return _scrape_extraspace(html)
+    if "cubesmart.com" in d:
+        return _scrape_cubesmart(html)
+    if "lifestorage.com" in d:
+        return _scrape_lifestorage(html)
+    if "uhaul.com" in d:
+        return _scrape_uhaul(html)
+    return {}  # unknown domain → fall back to generic below
+
 def scrape_rates_from_website(url):
     if not url:
         return {}
-    txt = _safe_fetch_text(url)
-    if not txt:
+    # Cache by URL
+    ck=f"rates:{url}"
+    cached=cache_get(ck)
+    if cached is not None:
+        return cached
+
+    html=_safe_fetch_text(url)
+    if not html:
+        cache_set(ck,{})
         return {}
 
+    # Try domain-specific parser first (accuracy boost)
     try:
-        soup = BeautifulSoup(txt, 'html.parser')
-        visible = soup.get_text(separator=' ', strip=True)
-        combined = (visible[:500_000]).lower()
+        ds=_domain_specific_rates(url, html)
     except Exception:
-        combined = re.sub(r'<[^>]+>', ' ', txt)[:500_000].lower()
+        ds={}
+    # Generic strategies
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        combined = soup.get_text(separator=' ', strip=True).lower()[:600_000]
+    except Exception:
+        combined = re.sub(r'<[^>]+>', ' ', html).lower()[:600_000]
         soup = None
 
-    candidates = []
-
-    # 1) JSON-LD
+    generic_candidates=[]
     if soup is not None:
-        try:
-            candidates.append(_parse_json_ld(soup))
-        except Exception:
-            pass
+        try: generic_candidates.append(_parse_json_ld(soup))
+        except: pass
+        try: generic_candidates.append(_parse_tables(soup))
+        except: pass
+        try: generic_candidates.append(_parse_cards(soup))
+        except: pass
+    try: generic_candidates.append(_regex_fallback(combined))
+    except: pass
 
-    # 2) Vendor-style JSON blobs
-    if soup is not None:
-        for s in soup.find_all("script"):
-            raw = (s.string or s.text or "").strip()
-            if not raw:
-                continue
-            if any(key in raw for key in ("__NUXT__", "__PRELOADED_STATE__", "INITIAL_STATE", "window.__", "nuxtState")):
-                try:
-                    # coarse clean for "window.__STATE__ = {...}" styles
-                    json_txt = raw
-                    json_txt = re.sub(r"^[^{\[]+", "", json_txt)   # strip leading code to the first { or [
-                    json_txt = re.sub(r";\s*$", "", json_txt)
-                    data = json.loads(json_txt)
-                    # walk the JSON to find any items containing size+price text
-                    def walk(o):
-                        local_rates = {}
-                        if isinstance(o, dict):
-                            txt = json.dumps(o).lower()
-                            # find sizes in the string form
-                            for m in _UNIT_RE.finditer(txt):
-                                size = _normalize_size(m.group(1), m.group(2))
-                                if not size:
-                                    continue
-                                prices = _PRICE_RE.findall(txt)
-                                vals = []
-                                for p in prices:
-                                    try:
-                                        v = float(p)
-                                        if 15 <= v <= 1000:
-                                            vals.append(v)
-                                    except:
-                                        pass
-                                if vals:
-                                    cc_bucket = None
-                                    if _CC_POS.search(txt) and not _CC_NEG.search(txt): cc_bucket = "climate"
-                                    elif _CC_NEG.search(txt) and not _CC_POS.search(txt): cc_bucket = "non_climate"
-                                    price = min(vals)
-                                    local_rates.setdefault(size, {"climate": None, "non_climate": None})
-                                    if cc_bucket == "climate":
-                                        local_rates[size]["climate"] = price
-                                    elif cc_bucket == "non_climate":
-                                        local_rates[size]["non_climate"] = price
-                                    else:
-                                        if local_rates[size]["non_climate"] is None:
-                                            local_rates[size]["non_climate"] = price
-                                        elif local_rates[size]["climate"] is None:
-                                            local_rates[size]["climate"] = price
-                                    # don't break—there might be more sizes
-                            for v in o.values():
-                                sub = walk(v)
-                                if sub:
-                                    local_rates = _merge_rate_dicts([local_rates, sub])
-                        elif isinstance(o, list):
-                            local_rates = {}
-                            for it in o:
-                                sub = walk(it)
-                                if sub:
-                                    local_rates = _merge_rate_dicts([local_rates, sub])
-                        else:
-                            return {}
-                        return local_rates
-                    found = walk(data)
-                    if found:
-                        candidates.append(found)
-                except Exception:
-                    pass
-
-    # 3) Table extraction
-    if soup is not None:
-        try:
-            candidates.append(_parse_tables(soup))
-        except Exception:
-            pass
-
-    # 4) Card extraction
-    if soup is not None:
-        try:
-            candidates.append(_parse_cards(soup))
-        except Exception:
-            pass
-
-    # 5) Regex fallback on combined text
-    try:
-        candidates.append(_regex_fallback(combined))
-    except Exception:
-        pass
-
-    merged = _merge_rate_dicts(candidates)
-    # whitelist filter
-    merged = {k: v for k, v in merged.items() if k in SIZE_WHITELIST}
+    merged=_merge_rate_dicts([ds]+generic_candidates)
+    cache_set(ck, merged)
     return merged
+
+DISCOVERY_PATHS = ["/units", "/rent", "/storage-units", "/self-storage", "/pricing", "/rates", "/rent-online"]
+
+def _try_discovery_paths(base_url, max_paths=3):
+    """Try a few common rate pages for a site, quickly."""
+    found=[]
+    try:
+        parsed=urlparse(base_url)
+        if not parsed.scheme or not parsed.netloc: 
+            return found
+        for path in DISCOVERY_PATHS:
+            if len(found)>=max_paths: break
+            u=urljoin(base_url, path)
+            txt=_safe_fetch_text(u, timeout=PER_REQUEST_TIMEOUT)
+            if txt and len(txt)>500:
+                found.append(u)
+    except:
+        pass
+    return found
 
 def discover_website_for(name, vicinity, fallback_query_suffix="storage units prices"):
     query = f"{name} {vicinity} {fallback_query_suffix}".strip()
+    ck=f"discover:{query}"
+    c=cache_get(ck)
+    if c is not None: return c
     try:
         for url in search(query, num_results=3):
-            u = url.lower()
+            u=url.lower()
             if any(t in u for t in [".com", ".net", ".org", ".storage"]) and not any(
                 b in u for b in ["facebook.com", "yelp.com", "google.com/maps", "bing.com", "yellowpages", "yahoo"]
             ):
+                cache_set(ck, url)
                 return url
     except Exception:
         pass
+    cache_set(ck, None)
     return None
 
-def _try_discovery_paths(base_url, time_left):
-    urls = []
-    try:
-        parsed = urlparse(base_url)
-        if not parsed.scheme or not parsed.netloc:
-            return []
-        for path in DISCOVERY_PATHS:
-            urls.append(urljoin(base_url, path))
-    except Exception:
-        return []
-    # fetch quickly, keep only pages that return non-empty html
-    good = []
-    deadline = time.time() + max(0, time_left)
-    for u in urls:
-        if time.time() > deadline:
-            break
-        txt = _safe_fetch_text(u, timeout=min(PER_REQUEST_TIMEOUT, max(1, int(deadline - time.time()))))
-        if txt and len(txt) > 500:
-            good.append(u)
-    return good
-
 def get_place_website(place_id):
+    ck=f"place_site:{place_id}"
+    c=cache_get(ck)
+    if c is not None:
+        return c
     try:
         res = requests.get(
             "https://maps.googleapis.com/maps/api/place/details/json",
-            params={'place_id': place_id, 'fields': 'website', 'key': GOOGLE_API_KEY},
+            params={'place_id': place_id, 'fields': 'website,url', 'key': GOOGLE_API_KEY},
             timeout=PER_REQUEST_TIMEOUT
         ).json()
-        return res.get('result', {}).get('website')
+        site = res.get('result', {}).get('website') or res.get('result', {}).get('url')
+        cache_set(ck, site)
+        return site
     except Exception:
+        cache_set(ck, None)
         return None
 
-def _scrape_site_with_discovery(base_url, time_budget_sec):
-    start = time.time()
-    all_rates = []
-    # 1) base page first
-    base_rates = scrape_rates_from_website(base_url)
-    if base_rates:
-        all_rates.append(base_rates)
-
-    time_left = time_budget_sec - (time.time() - start)
-    if time_left <= 0:
-        return _merge_rate_dicts(all_rates)
-
-    # 2) try discovery paths in parallel (fast)
-    discover_urls = _try_discovery_paths(base_url, time_left)
-    if not discover_urls:
-        return _merge_rate_dicts(all_rates)
-
-    time_left = time_budget_sec - (time.time() - start)
-    if time_left <= 0:
-        return _merge_rate_dicts(all_rates)
-
-    per_task_budget = max(2, int(time_left / len(discover_urls)))
-    with ThreadPoolExecutor(max_workers=min(4, len(discover_urls))) as ex:
-        futures = {ex.submit(scrape_rates_from_website, u): u for u in discover_urls}
-        for fut in as_completed(futures):
-            rates = {}
-            try:
-                rates = fut.result(timeout=per_task_budget)
-            except Exception:
-                pass
-            if rates:
-                all_rates.append(rates)
-
+def _scrape_site_with_discovery(base_url, extra_budget_ok=True):
+    all_rates=[]
+    # base page
+    base_rates=scrape_rates_from_website(base_url)
+    if base_rates: all_rates.append(base_rates)
+    # try a few common paths
+    if extra_budget_ok:
+        for u in _try_discovery_paths(base_url):
+            r=scrape_rates_from_website(u)
+            if r: all_rates.append(r)
     return _merge_rate_dicts(all_rates)
 
 def build_rate_analysis(subject_place, market):
-    """
-    Scrape subject + up to N competitors with a total time budget.
-    """
-    start_time = time.time()
+    start = time.time()
 
-    # Subject site
+    # Subject
     subject_site = subject_place.get('website') if subject_place else None
     if not subject_site and subject_place:
-        subj_name = subject_place.get('name', '')
-        if time.time() - start_time < TOTAL_RATE_SCRAPE_BUDGET:
-            subject_site = discover_website_for(subj_name, "")
+        subject_site = discover_website_for(subject_place.get('name', ''), "")
 
-    subject_rates = {}
-    if subject_site and (time.time() - start_time < TOTAL_RATE_SCRAPE_BUDGET):
-        # give subject a bit more budget than a single page because it matters most
-        subject_rates = _scrape_site_with_discovery(subject_site, time_budget_sec=8)
+    subject_rates={}
+    if subject_site:
+        subject_rates = _scrape_site_with_discovery(subject_site, extra_budget_ok=True)
 
-    # Competitors
+    # Competitors (parallel, capped)
     competitors = market.get('competitors_5', [])[:MAX_COMPETITORS_TO_SCRAPE]
 
-    def scrape_comp(comp):
-        name = comp.get('name', '')
-        vicinity = comp.get('vicinity', '')
-        website = get_place_website(comp.get('place_id')) or discover_website_for(name, vicinity)
-        rates = {}
+    def scrape_comp(c):
+        name=c.get('name',''); vicinity=c.get('vicinity','')
+        website = get_place_website(c.get('place_id')) or discover_website_for(name, vicinity)
+        rates={}
         if website:
-            rates = scrape_rates_from_website(website)
-            # if very sparse, try discovery paths quickly
-            filled = any(v.get('climate') or v.get('non_climate') for v in rates.values())
-            if not filled:
-                rates = _merge_rate_dicts([rates, _scrape_site_with_discovery(website, time_budget_sec=5)])
-        rates = {k: v for k, v in rates.items() if k in SIZE_WHITELIST}
-        return {
-            'name': name,
-            'vicinity': vicinity,
-            'website': website or '',
-            'rates': rates
-        }
+            rates = _scrape_site_with_discovery(website, extra_budget_ok=False)
+        rates={k:v for k,v in rates.items() if k in SIZE_WHITELIST}
+        return {'name':name,'vicinity':vicinity,'website':website or '','rates':rates}
 
-    competitors_data = []
-    time_left = TOTAL_RATE_SCRAPE_BUDGET - (time.time() - start_time)
-    if time_left > 0 and competitors:
-        # split remaining budget across competitors in parallel
-        max_workers = min(6, len(competitors))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(scrape_comp, c): c for c in competitors}
-            for fut in as_completed(futures, timeout=max(5, int(time_left))):
+    competitors_data=[]
+    if competitors:
+        with ThreadPoolExecutor(max_workers=min(6, len(competitors))) as ex:
+            futures = [ex.submit(scrape_comp, c) for c in competitors]
+            for fut in as_completed(futures, timeout=TOTAL_RATE_SCRAPE_BUDGET):
                 try:
-                    res = fut.result(timeout=3)
-                    competitors_data.append(res)
+                    competitors_data.append(fut.result(timeout=3))
                 except Exception:
-                    # ignore slow/failed competitor
                     pass
 
-    # Build summary table
+    # Summary
     def avg(xs): return round(sum(xs)/len(xs), 2) if xs else 0
-    summary = {}
-    for size in sorted(list(SIZE_WHITELIST)):
-        subj_cc = subject_rates.get(size, {}).get('climate')
-        subj_nc = subject_rates.get(size, {}).get('non_climate')
-
-        comp_cc_prices = []
-        comp_nc_prices = []
+    summary={}
+    for size in sorted(SIZE_WHITELIST):
+        subj_cc = subject_rates.get(size,{}).get('climate')
+        subj_nc = subject_rates.get(size,{}).get('non_climate')
+        cc_prices=[]; nc_prices=[]
         for c in competitors_data:
-            cr = c['rates'].get(size)
+            cr=c['rates'].get(size)
             if cr:
-                if cr.get('climate') is not None:
-                    comp_cc_prices.append(cr['climate'])
-                if cr.get('non_climate') is not None:
-                    comp_nc_prices.append(cr['non_climate'])
-
-        cc_avg, cc_max = avg(comp_cc_prices), (max(comp_cc_prices) if comp_cc_prices else 0)
-        nc_avg, nc_max = avg(comp_nc_prices), (max(comp_nc_prices) if comp_nc_prices else 0)
-
-        inc_cc = round(((cc_max - subj_cc) / subj_cc) * 100, 2) if subj_cc and cc_max else 0
-        inc_nc = round(((nc_max - subj_nc) / subj_nc) * 100, 2) if subj_nc and nc_max else 0
-
-        summary[size] = {
+                if cr.get('climate') is not None: cc_prices.append(cr['climate'])
+                if cr.get('non_climate') is not None: nc_prices.append(cr['non_climate'])
+        cc_avg, cc_max = avg(cc_prices), (max(cc_prices) if cc_prices else 0)
+        nc_avg, nc_max = avg(nc_prices), (max(nc_prices) if nc_prices else 0)
+        inc_cc = round(((cc_max - subj_cc) / subj_cc)*100, 2) if subj_cc and cc_max else 0
+        inc_nc = round(((nc_max - subj_nc) / subj_nc)*100, 2) if subj_nc and nc_max else 0
+        summary[size]={
             'subject_climate': subj_cc,
             'subject_non_climate': subj_nc,
             'comp_avg_climate': cc_avg,
@@ -797,12 +862,13 @@ def build_rate_analysis(subject_place, market):
             'increase_pct_non_climate': inc_nc
         }
 
-    subject_rates = {k: v for k, v in subject_rates.items() if k in SIZE_WHITELIST}
+    subject_rates={k:v for k,v in subject_rates.items() if k in SIZE_WHITELIST}
     return subject_rates, competitors_data, summary
-# === END NEW ===
 
 
-# 6) Tax history stub
+# =============================================================================
+# 6) Tax stub (unchanged)
+# =============================================================================
 def get_tax_history(address):
     return [
         {'year': 2023, 'tax': 3200},
@@ -811,6 +877,9 @@ def get_tax_history(address):
     ]
 
 
+# =============================================================================
+# 7) Flask view (unchanged, except storing new rate fields)
+# =============================================================================
 @app.route('/', methods=['GET', 'POST'])
 def index():
     data = {
@@ -892,6 +961,7 @@ def index():
                 taxes     = get_tax_history(addr)
                 avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
+                # NEW: stronger, cached rate analysis
                 subj_rates, comp_rates, summary = build_rate_analysis(place or {}, market)
 
                 data.update({
