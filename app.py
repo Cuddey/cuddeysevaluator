@@ -214,7 +214,7 @@ def get_market_comps(lat, lng):
 
 
 # =====================================
-# 5) Nearby Listings on CREXI/LoopNet
+# 5) Nearby Listings on CREXI/LoopNet (kept as in your version)
 # =====================================
 def scrape_crexi(lat, lng, radius_m=1):
     listings = []
@@ -303,10 +303,8 @@ DISCOUNT_HINTS = re.compile(r'(now|online|special|promo|discount|sale|deal|today
 
 HEADLESS_RATES = os.getenv("HEADLESS_RATES", "1").strip() != "0"
 
-# Selenium setup (lazy)
+# Selenium availability flag
 _SELENIUM_OK = None
-_driver_path_hint = os.getenv("CHROMEDRIVER_PATH")  # optional
-
 
 def _have_selenium():
     global _SELENIUM_OK
@@ -321,8 +319,11 @@ def _have_selenium():
     return _SELENIUM_OK
 
 
-def _headless_html(url, timeout=12):
-    """Fetch fully rendered HTML via Selenium headless. Returns '' on failure."""
+def _headless_html(url, timeout=15):
+    """
+    Fetch fully rendered HTML via Selenium headless Chrome.
+    Configured to work on Render with GOOGLE_CHROME_BIN and CHROMEDRIVER_PATH.
+    """
     if not HEADLESS_RATES or not _have_selenium():
         return ""
     try:
@@ -332,20 +333,26 @@ def _headless_html(url, timeout=12):
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
 
+        chrome_bin = os.getenv("GOOGLE_CHROME_BIN", "/usr/bin/google-chrome")
+        driver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
+
         options = Options()
+        options.binary_location = chrome_bin
         options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1200,2000")
-        # Try selenium-manager (Selenium 4.6+) to auto-manage driver:
-        driver = webdriver.Chrome(options=options)
+        options.add_argument("--window-size=1200,2400")
+        options.add_argument("--hide-scrollbars")
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+
+        driver = webdriver.Chrome(executable_path=driver_path, options=options)
         try:
             driver.set_page_load_timeout(timeout)
             driver.get(url)
-            # wait for something meaningful to render
             try:
-                WebDriverWait(driver, 6).until(
+                WebDriverWait(driver, 10).until(
                     EC.presence_of_all_elements_located((By.TAG_NAME, "body"))
                 )
             except Exception:
@@ -361,7 +368,7 @@ def _headless_html(url, timeout=12):
 def _http_html(url, timeout=10, max_bytes=900_000):
     """Fast HTTP fetch (no JS)."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"}
         with requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True) as r:
             ct = (r.headers.get("Content-Type") or "").lower()
             if "html" not in ct:
@@ -489,7 +496,7 @@ def scrape_rates_from_website(url):
             pass
 
     merged = {}
-    # short budget for secondary pages
+    # budget for secondary pages
     for i, u in enumerate(candidates[:4]):
         h = html if i == 0 else (_headless_html(u) or _http_html(u))
         if not h:
@@ -568,7 +575,7 @@ def build_rate_analysis(subject_place, market):
 
     # Competitors (all within 5 miles); include even if no website
     competitors_raw = market.get('competitors_5', [])
-    MAX_COMP = 12  # cover all typical sites in dense markets without timeouts
+    MAX_COMP = 10  # dialed down slightly to avoid timeouts on free/low resources
     competitors = competitors_raw[:MAX_COMP]
 
     def scrape_comp(c):
@@ -579,7 +586,6 @@ def build_rate_analysis(subject_place, market):
             rates = scrape_rates_from_website(website)
         else:
             rates = {}
-        # Only self-storage: light filter by name keywords (optional; Places type is already 'storage')
         return {
             'name': name,
             'vicinity': vicinity,
@@ -589,9 +595,9 @@ def build_rate_analysis(subject_place, market):
 
     comp_data = []
     if competitors:
-        with ThreadPoolExecutor(max_workers=min(6, len(competitors))) as ex:
+        with ThreadPoolExecutor(max_workers=min(4, len(competitors))) as ex:
             futures = [ex.submit(scrape_comp, c) for c in competitors]
-            for f in as_completed(futures, timeout=20):
+            for f in as_completed(futures, timeout=45):
                 try:
                     comp_data.append(f.result())
                 except Exception:
@@ -632,7 +638,7 @@ def build_rate_analysis(subject_place, market):
 
 
 # =====================================
-# 7) Flask view (kept intact; only adds rate fields)
+# 7) Flask view (unchanged; only adds rate fields)
 # =====================================
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -716,7 +722,7 @@ def index():
                 taxes     = get_tax_history(addr)
                 avg_tax   = round(sum(r['tax'] for r in taxes) / len(taxes), 2) if taxes else 0
 
-                # NEW: subject + competitors standard rate analysis
+                # Subject + competitors standard rate analysis (new)
                 subj_rates, comp_rates, summary = build_rate_analysis(place or {}, market)
 
                 data.update({
@@ -748,4 +754,5 @@ def index():
     return render_template('index.html', data=data, error=error, google_api_key=GOOGLE_API_KEY)
 
 if __name__ == '__main__':
+    # For local testing
     app.run(debug=True)
