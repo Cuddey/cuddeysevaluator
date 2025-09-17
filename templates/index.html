@@ -1,10 +1,20 @@
-<!-- templates/index.html -->
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>Cuddeys Deal Finder</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    /* Added a touch of styling for the rates table only */
+    .rates-card { border: 1px solid #e2e2e2; border-radius: 8px; padding: 12px; margin: 16px 0; background: #fafafa; }
+    .rates-table { width:100%; border-collapse: collapse; }
+    .rates-table th, .rates-table td { border:1px solid #ddd; padding:8px; }
+    .rates-table th { background:#f3f6ff; }
+    .tag { display:inline-block; padding:2px 6px; border-radius:4px; font-size:12px; background:#eef; color:#224; }
+    .muted { color:#777; font-style: italic; }
+    .comp-name { font-weight:600; }
+    .no-site { color:#a33; font-style: italic; }
+  </style>
 </head>
 <body>
   <div class="container">
@@ -194,7 +204,7 @@
             new google.maps.Marker({
               position: { lat: {{ c.lat }}, lng: {{ c.lng }} },
               map: map,
-              title: "{{ c.name }}"
+              title: "{{ c.name|e }}"
             });
           {% endfor %}
         }
@@ -202,6 +212,103 @@
       <script async defer
         src="https://maps.googleapis.com/maps/api/js?key={{ google_api_key }}&callback=initMap">
       </script>
+
+      <!-- ===== NEW: Subject & Competitor Standard Rates (non-discounted) ===== -->
+      <h3>🏷️ Standard Rates (Subject & 5-mile Competitors)</h3>
+      <div class="rates-card">
+        {% set sizes = ["5x5","5x10","10x10","10x15","10x20","10x30"] %}
+        <h4>Subject: {{ data.place.name or data.address }}</h4>
+        {% if data.subject_rates %}
+          <table class="rates-table">
+            <tr>
+              <th>Unit</th>
+              <th>Non-Climate</th>
+              <th>Climate</th>
+            </tr>
+            {% for s in sizes %}
+              {% set r = data.subject_rates.get(s) %}
+              <tr>
+                <td><span class="tag">{{ s }}</span></td>
+                <td>
+                  {% if r and r.non_climate is not none %}
+                    ${{ "%.0f"|format(r.non_climate) }}
+                  {% else %}
+                    <span class="muted">n/a</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if r and r.climate is not none %}
+                    ${{ "%.0f"|format(r.climate) }}
+                  {% else %}
+                    <span class="muted">n/a</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </table>
+        {% else %}
+          <p class="muted">No subject standard rates found on website.</p>
+        {% endif %}
+      </div>
+
+      <div class="rates-card">
+        <h4>Competitors (within 5 miles)</h4>
+        <table class="rates-table">
+          <tr>
+            <th>Competitor</th>
+            <th>Website</th>
+            <th>Unit</th>
+            <th>Non-Climate</th>
+            <th>Climate</th>
+          </tr>
+          {% for comp in data.competitor_rates %}
+            {% set rows = [] %}
+            {% for s in sizes %}
+              {% if comp.rates.get(s) %}
+                {% set rows = rows + [s] %}
+              {% endif %}
+            {% endfor %}
+            {% if rows|length == 0 %}
+              <tr>
+                <td class="comp-name">{{ comp.name }}</td>
+                <td>
+                  {% if comp.website %}
+                    <a href="{{ comp.website }}" target="_blank">Site</a>
+                  {% else %}
+                    <span class="no-site">No website found</span>
+                  {% endif %}
+                </td>
+                <td colspan="3" class="muted">No standard rates detected</td>
+              </tr>
+            {% else %}
+              {% for idx, s in enumerate(rows) %}
+                {% set r = comp.rates.get(s) %}
+                <tr>
+                  {% if idx == 0 %}
+                    <td class="comp-name" rowspan="{{ rows|length }}">{{ comp.name }}</td>
+                    <td rowspan="{{ rows|length }}">
+                      {% if comp.website %}
+                        <a href="{{ comp.website }}" target="_blank">Site</a>
+                      {% else %}
+                        <span class="no-site">No website found</span>
+                      {% endif %}
+                    </td>
+                  {% endif %}
+                  <td><span class="tag">{{ s }}</span></td>
+                  <td>
+                    {% if r.non_climate is not none %}${{ "%.0f"|format(r.non_climate) }}{% else %}<span class="muted">n/a</span>{% endif %}
+                  </td>
+                  <td>
+                    {% if r.climate is not none %}${{ "%.0f"|format(r.climate) }}{% else %}<span class="muted">n/a</span>{% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            {% endif %}
+          {% endfor %}
+        </table>
+        <p class="muted">Shown prices are **standard** (crossed-out “was/regular/in-store”) when present; discounted/promo prices are ignored.</p>
+      </div>
+      <!-- ===== END new section ===== -->
 
     {% endif %}
   </div>
