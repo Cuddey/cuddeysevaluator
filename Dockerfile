@@ -2,7 +2,7 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# Install system dependencies required for Chrome
+# Install system dependencies required by Chrome/Chromedriver
 RUN apt-get update && apt-get install -y \
     wget unzip curl gnupg ca-certificates apt-transport-https \
     fonts-liberation xdg-utils \
@@ -15,12 +15,12 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 libxrender1 libxss1 libxtst6 \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Chrome
+# Install Google Chrome
 RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
  && apt-get update && apt-get install -y ./google-chrome-stable_current_amd64.deb \
  && rm google-chrome-stable_current_amd64.deb
 
-# Install Chromedriver
+# Install matching Chromedriver
 RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}') \
  && CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1) \
  && wget -q "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}" -O LATEST_RELEASE \
@@ -29,13 +29,14 @@ RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}') \
  && unzip chromedriver_linux64.zip -d /usr/local/bin/ \
  && rm chromedriver_linux64.zip LATEST_RELEASE
 
-# Install Python deps
+# Copy requirements and install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
+# Copy app code
 COPY . .
 
 EXPOSE 5000
 
+# Gunicorn to serve Flask
 CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
