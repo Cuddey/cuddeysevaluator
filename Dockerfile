@@ -2,9 +2,9 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install system and Python dependencies
+# Install system dependencies (no python3-pip this time)
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-dev \
+    python3 python3-dev python3-venv \
     wget curl gnupg ca-certificates unzip \
     fonts-liberation xdg-utils \
     libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 \
@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 libxrender1 libxss1 libxtst6 \
  && rm -rf /var/lib/apt/lists/*
 
+# Install pip manually (avoids externally-managed-environment issue)
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3
+
 # Add Google’s apt repo and install Chrome + Chromedriver
 RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux.gpg \
  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
@@ -26,8 +29,8 @@ RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor
 
 # Copy requirements and install Python packages
 COPY requirements.txt .
-RUN pip3 install --upgrade pip setuptools wheel \
- && pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the app
 COPY . .
