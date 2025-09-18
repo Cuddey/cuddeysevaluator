@@ -1,9 +1,8 @@
 FROM debian:bookworm-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install Python and Chrome dependencies
+# Install base dependencies
 RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-dev \
     wget unzip curl gnupg ca-certificates apt-transport-https \
@@ -17,21 +16,15 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 libxrender1 libxss1 libxtst6 \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Google Chrome
-RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
- && apt-get update && apt-get install -y ./google-chrome-stable_current_amd64.deb \
- && rm google-chrome-stable_current_amd64.deb
+# Add Google’s apt repo for Chrome + Chromedriver
+RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux.gpg \
+ && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+    > /etc/apt/sources.list.d/google-chrome.list \
+ && apt-get update \
+ && apt-get install -y google-chrome-stable chromium-driver \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install matching Chromedriver
-RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}') \
- && CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1) \
- && wget -q "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}" -O LATEST_RELEASE \
- && CHROMEDRIVER_VERSION=$(cat LATEST_RELEASE) \
- && wget -q "https://chromedriver.storage.googleapis.com/${CHROMEDRIVER_VERSION}/chromedriver_linux64.zip" \
- && unzip chromedriver_linux64.zip -d /usr/local/bin/ \
- && rm chromedriver_linux64.zip LATEST_RELEASE
-
-# Copy Python requirements and install deps
+# Copy requirements and install Python deps
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
@@ -40,5 +33,5 @@ COPY . .
 
 EXPOSE 5000
 
-# Start with Gunicorn
+# Start Flask with Gunicorn
 CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
